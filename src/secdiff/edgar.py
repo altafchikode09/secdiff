@@ -121,6 +121,24 @@ class EdgarClient:
         name_m = re.search(r"<conformed-name>([^<]+)</conformed-name>", raw)
         return int(cik_m.group(1)), (name_m.group(1).title() if name_m else ticker)
 
+    @staticmethod
+    def _ticker_variants(ticker: str) -> list[str]:
+        """Spellings to try for a ticker, in order.
+
+        Class shares are typed in market format with a dot (BRK.B), but
+        EDGAR lists them with a dash (BRK-B) — and a few with a slash or no
+        separator. Try the typed spelling first, then dot->dash, dot->slash,
+        dot removed. Every variant still goes through the same verified
+        resolution; a variant is never trusted on spelling alone.
+        """
+        variants = [ticker]
+        if "." in ticker:
+            for v in (ticker.replace(".", "-"), ticker.replace(".", "/"),
+                      ticker.replace(".", "")):
+                if v not in variants:
+                    variants.append(v)
+        return variants
+
     def resolve_ticker(self, ticker: str, form: str = "10-K",
                        min_count: int = 2) -> tuple[int, str]:
         """Resolve a ticker to the entity that actually files `form`.
@@ -129,8 +147,10 @@ class EdgarClient:
         accepted only if its own EDGAR submission history contains at least
         `min_count` recent filings of the requested form. Candidates come
         from, in order: company_tickers.json, company_tickers_exchange.json,
-        and EDGAR's classic browse-edgar ticker lookup. If no entity carrying
-        this ticker files the form, exit with an error naming what was found.
+        and EDGAR's classic browse-edgar ticker lookup. If the typed spelling
+        is not found, separator variants are tried (BRK.B -> BRK-B -> BRK/B
+        -> BRKB). If no entity carrying this ticker files the form, exit
+        with an error naming what was found.
         """
         ticker = ticker.upper().strip()
         checked: list[tuple[int, str, int]] = []  # cik, name, form count
@@ -153,19 +173,25 @@ class EdgarClient:
                     return cik, name
             return None
 
-        hit = try_candidates(self._candidates_from_tickers_file(ticker))
-        if hit:
-            return hit
-        hit = try_candidates(self._candidates_from_exchange_file(ticker))
-        if hit:
-            return hit
-        browse = self._candidate_from_browse_edgar(ticker)
-        if browse:
-            hit = try_candidates([browse])
+        for spelling in self._ticker_variants(ticker):
+            hit = try_candidates(self._candidates_from_tickers_file(spelling))
+            if not hit:
+                hit = try_candidates(self._candidates_from_exchange_file(spelling))
+            if not hit:
+                browse = self._candidate_from_browse_edgar(spelling)
+                if browse:
+                    hit = try_candidates([browse])
             if hit:
+                if spelling != ticker:
+                    print(f"Note: EDGAR lists {ticker} as {spelling} — "
+                          f"using that spelling.", file=sys.stderr)
                 return hit
         if not checked:
-            raise SystemExit(f"Ticker not found on EDGAR: {ticker}")
+            msg = f"Ticker not found on EDGAR: {ticker}"
+            if "." in ticker or " " in ticker or len(ticker) > 5:
+                msg += (" Note: use the ticker symbol (e.g. AAPL), and for "
+                        "class shares EDGAR uses a dash (BRK-B not BRK.B).")
+            raise SystemExit(msg)
         found = "; ".join(f"{nm} (CIK {c}, {k} recent {form} filing(s))"
                           for c, nm, k in checked)
         raise SystemExit(

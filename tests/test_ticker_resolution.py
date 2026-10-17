@@ -112,6 +112,45 @@ def test_no_entity_files_form_fails_naming_what_was_found():
     assert "10-Q" in msg
 
 
+def test_dot_class_ticker_resolves_via_dash_variant():
+    """BRK.B typed in market format must find EDGAR's BRK-B listing."""
+    client = FakeClient({
+        "company_tickers.json": {
+            "0": {"cik_str": 555, "ticker": "BRK-B", "title": "Berkshire-like Inc"}},
+        "company_tickers_exchange.json": {"fields": [], "data": []},
+        "submissions_0000000555.json": subs(["10-K", "10-K", "10-K"]),
+    }, browse_atom=b"<feed></feed>")
+    cik, name = client.resolve_ticker("BRK.B", form="10-K", min_count=2)
+    assert (cik, name) == (555, "Berkshire-like Inc")
+
+
+def test_variants_still_require_form_filing_check():
+    """A dash variant that files no 10-K must not win over a later variant
+    whose entity actually files the form."""
+    client = FakeClient({
+        "company_tickers.json": {
+            "0": {"cik_str": 111, "ticker": "BRK-B", "title": "Dash Holdings"},
+            "1": {"cik_str": 666, "ticker": "BRK/B", "title": "Slash Operating Co"}},
+        "company_tickers_exchange.json": {"fields": [], "data": []},
+        "submissions_0000000111.json": subs(["8-K", "8-K"]),
+        "submissions_0000000666.json": subs(["10-K", "10-K"]),
+    }, browse_atom=b"<feed></feed>")
+    cik, name = client.resolve_ticker("BRK.B", form="10-K", min_count=2)
+    assert (cik, name) == (666, "Slash Operating Co")
+
+
+def test_unknown_class_ticker_errors_with_hint():
+    client = FakeClient({
+        "company_tickers.json": {},
+        "company_tickers_exchange.json": {"fields": [], "data": []},
+    }, browse_atom=b"<feed></feed>")
+    with pytest.raises(SystemExit) as exc:
+        client.resolve_ticker("ZZ.Z")
+    msg = str(exc.value)
+    assert "not found" in msg.lower()
+    assert "BRK-B" in msg  # class-share hint is included
+
+
 def test_unknown_ticker_fails_as_not_found():
     client = FakeClient({
         "company_tickers.json": {},
