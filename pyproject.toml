@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "secdiff"
+version = "0.1.0"
+description = "git diff for SEC filings: compare a company's latest 10-K against its prior 10-K — words and XBRL numbers, deletions first."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "secdiff contributors" }]
+keywords = ["sec", "edgar", "10-k", "filings", "diff", "xbrl", "finance"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Office/Business :: Financial",
+]
+# v1 deliberately has ZERO runtime dependencies: it talks to SEC EDGAR with
+# the Python standard library only, so `pip install secdiff` can never break
+# on a dependency tree. (EdgarTools is a fine library; secdiff's own small
+# EDGAR client keeps the install bulletproof.)
+dependencies = []
+
+[project.scripts]
+secdiff = "secdiff.cli:main"
+secdiff-web = "secdiff.web:main"
+
+[project.urls]
+Homepage = "https://www.sec.gov/edgar"  # placeholder until the project repo is published
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+secdiff = ["demo_data/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

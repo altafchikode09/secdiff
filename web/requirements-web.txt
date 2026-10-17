@@ -1,0 +1,12 @@
+# The secdiff web layer has NO extra dependencies.
+#
+# It is built on the Python standard library (http.server) plus the
+# secdiff package itself, which is also stdlib-only. To run the website,
+# install the package from the repo root and start the server:
+#
+#     pip install .
+#     python -m secdiff.web        # or: secdiff serve  /  secdiff-web
+#
+# This file exists so hosting platforms that look for a requirements
+# file find an explicit statement instead of guessing: there is nothing
+# to add here. Python 3.10+ is the only requirement.
