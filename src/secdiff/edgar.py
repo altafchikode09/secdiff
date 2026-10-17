@@ -184,11 +184,16 @@ class EdgarClient:
         """Fallback for when the input is not a ticker at all: treat it as
         a company NAME and search EDGAR titles (see _name_matches).
 
-        Exactly one best-tier match -> resolve to it (the entity must still
-        pass the same form-filing check as a ticker candidate) and note the
-        match on stderr. Several matches -> exit listing the candidates;
-        a name is never guessed. No matches -> exit with the honest
-        not-found error plus the subsidiary/parent hint.
+        Matches on ONE company resolve to it (the entity must still pass
+        the same form-filing check as a ticker candidate) and note the
+        match on stderr. Several tickers on the SAME CIK are one company,
+        not an ambiguity — share classes of one filer (Alphabet's GOOG and
+        GOOGL) share the same filings, so the diff is identical whichever
+        is displayed; the first ticker alphabetically is used and the note
+        names them all. Matches spanning DIFFERENT companies -> exit
+        listing the candidates; a name is never guessed across companies.
+        No matches -> exit with the honest not-found error plus the
+        subsidiary/parent hint.
         """
         matches = self._name_matches(raw_query)
         if not matches:
@@ -201,7 +206,7 @@ class EdgarClient:
                 msg += (" For class shares EDGAR uses a dash "
                         "(BRK-B not BRK.B).")
             raise SystemExit(msg)
-        if len(matches) > 1:
+        if len({cik for cik, _, _ in matches}) > 1:
             cands = "; ".join(f"{t} — {title}" for _, t, title in matches[:5])
             if len(matches) > 5:
                 cands += f"; … and {len(matches) - 5} more"
@@ -209,12 +214,19 @@ class EdgarClient:
                 f"'{raw_query.strip()}' matches more than one listed "
                 f"company — not guessing. Candidates: {cands}. "
                 "Re-run with the ticker you mean.")
-        cik0, tick0, title0 = matches[0]
+        cik0, title0 = matches[0][0], matches[0][2]
+        tickers = sorted({t for _, t, _ in matches})
+        tick0 = tickers[0]
         hit = try_candidates([(cik0, title0)])
         if hit:
             self.name_matched_ticker = tick0
-            print(f"Note: Company name '{raw_query.strip()}' matched "
-                  f"{tick0} — {title0}.", file=sys.stderr)
+            if len(tickers) > 1:
+                print(f"Note: Company name '{raw_query.strip()}' matched "
+                      f"{title0} ({'/'.join(tickers)}) — using {tick0}.",
+                      file=sys.stderr)
+            else:
+                print(f"Note: Company name '{raw_query.strip()}' matched "
+                      f"{tick0} — {title0}.", file=sys.stderr)
             return hit
         n = checked[-1][2] if checked else 0
         raise SystemExit(

@@ -176,6 +176,8 @@ def name_client():
                   "title": "Berkshire Hathaway Inc"},
             "4": {"cik_str": 999, "ticker": "OLD",
                   "title": "Dormant Holdings Inc"},
+            "5": {"cik_str": 201, "ticker": "ACM", "title": "Acme Corp"},
+            "6": {"cik_str": 202, "ticker": "ACX", "title": "Acme Corp"},
         },
         "company_tickers_exchange.json": {"fields": [], "data": []},
         "submissions_0000000789.json": subs(["10-K", "10-K", "10-K"]),
@@ -204,13 +206,49 @@ def test_company_name_prefix_resolves_with_note(capsys):
 
 
 def test_ambiguous_company_name_lists_candidates_and_never_guesses():
+    # "Acme" matches the same title at two DIFFERENT companies (CIKs) —
+    # that is a real ambiguity, so resolution must refuse and list both.
     client = name_client()
     with pytest.raises(SystemExit) as exc:
-        client.resolve_ticker("Berkshire Hathaway", form="10-K", min_count=2)
+        client.resolve_ticker("Acme", form="10-K", min_count=2)
     msg = str(exc.value)
     assert "not guessing" in msg
-    assert "BRK-A — Berkshire Hathaway Inc" in msg
-    assert "BRK-B — Berkshire Hathaway Inc" in msg
+    assert "ACM — Acme Corp" in msg
+    assert "ACX — Acme Corp" in msg
+
+
+def test_two_tickers_one_company_resolves(capsys):
+    # BRK-A and BRK-B are share classes of ONE filer (same CIK in the
+    # fixture): one company match, not an ambiguity — the filings, and
+    # therefore the diff, are identical. First ticker alphabetically is
+    # displayed and the note names both.
+    client = name_client()
+    cik, name = client.resolve_ticker("Berkshire Hathaway", form="10-K",
+                                      min_count=2)
+    assert (cik, name) == (106, "Berkshire Hathaway Inc")
+    assert client.name_matched_ticker == "BRK-A"
+    err = capsys.readouterr().err
+    assert "matched Berkshire Hathaway Inc (BRK-A/BRK-B) — using BRK-A" in err
+
+
+def test_alphabet_two_tickers_one_cik_resolves(capsys):
+    """Mirror of the owner's live case: 'Alphabet' -> EDGAR title
+    'Alphabet Inc.' carrying GOOGL and GOOG on the SAME CIK 1652044.
+    That is one company, so it resolves (to GOOG, first alphabetically)
+    instead of erroring as ambiguous or not found."""
+    client = FakeClient({
+        "company_tickers.json": {
+            "0": {"cik_str": 1652044, "ticker": "GOOGL",
+                  "title": "Alphabet Inc."},
+            "1": {"cik_str": 1652044, "ticker": "GOOG",
+                  "title": "Alphabet Inc."}},
+        "company_tickers_exchange.json": {"fields": [], "data": []},
+        "submissions_0001652044.json": subs(["10-K", "10-K", "10-K"]),
+    }, browse_atom=b"<feed></feed>")
+    cik, name = client.resolve_ticker("Alphabet", form="10-K", min_count=2)
+    assert (cik, name) == (1652044, "Alphabet Inc.")
+    assert client.name_matched_ticker == "GOOG"
+    assert "matched Alphabet Inc. (GOOG/GOOGL)" in capsys.readouterr().err
 
 
 def test_unknown_company_name_errors_with_parent_hint():
