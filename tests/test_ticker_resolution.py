@@ -159,3 +159,83 @@ def test_unknown_ticker_fails_as_not_found():
     with pytest.raises(SystemExit) as exc:
         client.resolve_ticker("NOPE")
     assert "not found" in str(exc.value).lower()
+
+
+# -- company-name fallback (only after every ticker spelling missed) --------
+
+def name_client():
+    """Ticker file with real-shaped titles: one-match names, a two-ticker
+    company (Berkshire-like), and a name whose entity files no 10-K."""
+    return FakeClient({
+        "company_tickers.json": {
+            "0": {"cik_str": 789, "ticker": "MSFT", "title": "MICROSOFT CORP"},
+            "1": {"cik_str": 320, "ticker": "AAPL", "title": "Apple Inc"},
+            "2": {"cik_str": 106, "ticker": "BRK-A",
+                  "title": "Berkshire Hathaway Inc"},
+            "3": {"cik_str": 106, "ticker": "BRK-B",
+                  "title": "Berkshire Hathaway Inc"},
+            "4": {"cik_str": 999, "ticker": "OLD",
+                  "title": "Dormant Holdings Inc"},
+        },
+        "company_tickers_exchange.json": {"fields": [], "data": []},
+        "submissions_0000000789.json": subs(["10-K", "10-K", "10-K"]),
+        "submissions_0000000320.json": subs(["10-K", "10-K"]),
+        "submissions_0000000106.json": subs(["10-K", "10-K", "10-K"]),
+        "submissions_0000000999.json": subs(["8-K", "8-K"]),
+    }, browse_atom=b"<feed></feed>")
+
+
+def test_company_name_exact_title_resolves_with_note(capsys):
+    client = name_client()
+    cik, name = client.resolve_ticker("Microsoft Corp", form="10-K",
+                                      min_count=2)
+    assert (cik, name) == (789, "MICROSOFT CORP")
+    assert client.name_matched_ticker == "MSFT"
+    err = capsys.readouterr().err
+    assert "Company name 'Microsoft Corp' matched MSFT — MICROSOFT CORP" in err
+
+
+def test_company_name_prefix_resolves_with_note(capsys):
+    client = name_client()
+    cik, _ = client.resolve_ticker("Microsoft", form="10-K", min_count=2)
+    assert cik == 789
+    assert client.name_matched_ticker == "MSFT"
+    assert "matched MSFT" in capsys.readouterr().err
+
+
+def test_ambiguous_company_name_lists_candidates_and_never_guesses():
+    client = name_client()
+    with pytest.raises(SystemExit) as exc:
+        client.resolve_ticker("Berkshire Hathaway", form="10-K", min_count=2)
+    msg = str(exc.value)
+    assert "not guessing" in msg
+    assert "BRK-A — Berkshire Hathaway Inc" in msg
+    assert "BRK-B — Berkshire Hathaway Inc" in msg
+
+
+def test_unknown_company_name_errors_with_parent_hint():
+    client = name_client()
+    with pytest.raises(SystemExit) as exc:
+        client.resolve_ticker("YouTube", form="10-K", min_count=2)
+    msg = str(exc.value)
+    assert "not found" in msg.lower()
+    assert "Alphabet" in msg and "GOOGL" in msg  # subsidiary -> parent hint
+
+
+def test_name_match_that_files_no_form_errors_honestly():
+    client = name_client()
+    with pytest.raises(SystemExit) as exc:
+        client.resolve_ticker("Dormant Holdings", form="10-K", min_count=2)
+    msg = str(exc.value)
+    assert "OLD" in msg and "Dormant Holdings Inc" in msg
+    assert "no diff can be built" in msg
+
+
+def test_real_ticker_never_takes_the_name_path(capsys):
+    # Ticker-first ordering: MSFT is a real ticker, so resolution must
+    # succeed through the ticker files with NO name note at all.
+    client = name_client()
+    cik, _ = client.resolve_ticker("MSFT", form="10-K", min_count=2)
+    assert cik == 789
+    assert client.name_matched_ticker is None
+    assert "Company name" not in capsys.readouterr().err

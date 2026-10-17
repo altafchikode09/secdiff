@@ -157,7 +157,10 @@ def live_pipeline(args):
     facts = client.company_facts(cik)
     xbrl = compute_delta(facts, older.accession, newer.accession)
     info = FilingInfo(
-        ticker=args.ticker.upper(), company=company, form=args.form, cik=cik,
+        # When the user typed a company name, label the report with the
+        # ticker it matched; otherwise with what they typed, as before.
+        ticker=client.name_matched_ticker or args.ticker.upper(),
+        company=company, form=args.form, cik=cik,
         new_accession=newer.accession, new_date=newer.filing_date,
         new_url=newer.document_url(cik), new_index_url=newer.index_url(cik),
         old_accession=older.accession, old_date=older.filing_date,
@@ -176,8 +179,9 @@ def make_parser() -> argparse.ArgumentParser:
         prog="secdiff",
         description="git diff for SEC filings — compare a company's latest "
                     "10-K with its prior one. Not investment advice.")
-    p.add_argument("ticker", help="Ticker symbol (e.g. AAPL), or 'demo' for "
-                                  "the bundled offline demo")
+    p.add_argument("ticker", help="Ticker symbol (e.g. AAPL) or company name "
+                                  "(e.g. Microsoft), or 'demo' for the bundled "
+                                  "offline demo")
     p.add_argument("--form", default="10-K", choices=["10-K", "10-Q"],
                    help="Filing form to compare (default: 10-K)")
     p.add_argument("--years", type=int, default=1,

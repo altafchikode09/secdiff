@@ -62,6 +62,10 @@ class EdgarClient:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._last_request = 0.0
+        # Set by resolve_ticker() when the input was a company NAME that
+        # matched exactly one ticker (see _resolve_by_name); None otherwise.
+        # Callers use it to label reports with the real ticker.
+        self.name_matched_ticker: str | None = None
 
     # -- low level ---------------------------------------------------------
     def _fetch(self, url: str, cache_name: str) -> bytes:
@@ -121,6 +125,42 @@ class EdgarClient:
         name_m = re.search(r"<conformed-name>([^<]+)</conformed-name>", raw)
         return int(cik_m.group(1)), (name_m.group(1).title() if name_m else ticker)
 
+    def _name_matches(self, query: str) -> list[tuple[int, str, str]]:
+        """Company-name matches for `query` in company_tickers.json.
+
+        Matching is case-insensitive on the EDGAR company title and only
+        ever returns the single best tier: exact title match, then title
+        starts-with the query at a word boundary, then the query appears
+        inside the title at a word boundary. Returns [(cik, ticker, title)]
+        sorted by ticker; empty when no title matches at any tier.
+        """
+        data = self._fetch_json(f"{BASE_FILES}/company_tickers.json",
+                                "company_tickers.json")
+        q = " ".join(query.upper().split())
+        if not q:
+            return []
+        word_re = re.compile(r"(?<![A-Z0-9])" + re.escape(q) + r"(?![A-Z0-9])")
+        exact: list[tuple[int, str, str]] = []
+        starts: list[tuple[int, str, str]] = []
+        contains: list[tuple[int, str, str]] = []
+        for row in data.values():
+            title = " ".join(str(row.get("title", "")).upper().split())
+            if not title:
+                continue
+            entry = (int(row["cik_str"]),
+                     str(row.get("ticker", "")).upper(),
+                     str(row.get("title", "")))
+            if title == q:
+                exact.append(entry)
+            elif title.startswith(q) and not title[len(q)].isalnum():
+                starts.append(entry)
+            elif word_re.search(title):
+                contains.append(entry)
+        for tier in (exact, starts, contains):
+            if tier:
+                return sorted(tier, key=lambda e: e[1])
+        return []
+
     @staticmethod
     def _ticker_variants(ticker: str) -> list[str]:
         """Spellings to try for a ticker, in order.
@@ -139,6 +179,49 @@ class EdgarClient:
                     variants.append(v)
         return variants
 
+    def _resolve_by_name(self, raw_query: str, form: str, min_count: int,
+                         try_candidates, checked: list) -> tuple[int, str]:
+        """Fallback for when the input is not a ticker at all: treat it as
+        a company NAME and search EDGAR titles (see _name_matches).
+
+        Exactly one best-tier match -> resolve to it (the entity must still
+        pass the same form-filing check as a ticker candidate) and note the
+        match on stderr. Several matches -> exit listing the candidates;
+        a name is never guessed. No matches -> exit with the honest
+        not-found error plus the subsidiary/parent hint.
+        """
+        matches = self._name_matches(raw_query)
+        if not matches:
+            msg = f"Ticker not found on EDGAR: {raw_query.strip().upper()}"
+            msg += (" Note: enter a ticker symbol (e.g. AAPL) or the listed "
+                    "company's name. Some brands are subsidiaries with no "
+                    "filing of their own — e.g. YouTube is part of Alphabet, "
+                    "so use GOOGL.")
+            if "." in raw_query:
+                msg += (" For class shares EDGAR uses a dash "
+                        "(BRK-B not BRK.B).")
+            raise SystemExit(msg)
+        if len(matches) > 1:
+            cands = "; ".join(f"{t} — {title}" for _, t, title in matches[:5])
+            if len(matches) > 5:
+                cands += f"; … and {len(matches) - 5} more"
+            raise SystemExit(
+                f"'{raw_query.strip()}' matches more than one listed "
+                f"company — not guessing. Candidates: {cands}. "
+                "Re-run with the ticker you mean.")
+        cik0, tick0, title0 = matches[0]
+        hit = try_candidates([(cik0, title0)])
+        if hit:
+            self.name_matched_ticker = tick0
+            print(f"Note: Company name '{raw_query.strip()}' matched "
+                  f"{tick0} — {title0}.", file=sys.stderr)
+            return hit
+        n = checked[-1][2] if checked else 0
+        raise SystemExit(
+            f"Company name '{raw_query.strip()}' matched {tick0} — {title0} "
+            f"(CIK {cik0}), but it files only {n} recent {form} filing(s) "
+            f"on EDGAR (need at least {min_count}); no diff can be built.")
+
     def resolve_ticker(self, ticker: str, form: str = "10-K",
                        min_count: int = 2) -> tuple[int, str]:
         """Resolve a ticker to the entity that actually files `form`.
@@ -149,10 +232,15 @@ class EdgarClient:
         from, in order: company_tickers.json, company_tickers_exchange.json,
         and EDGAR's classic browse-edgar ticker lookup. If the typed spelling
         is not found, separator variants are tried (BRK.B -> BRK-B -> BRK/B
-        -> BRKB). If no entity carrying this ticker files the form, exit
-        with an error naming what was found.
+        -> BRKB). If the input is not a ticker at all, it is retried as a
+        company NAME against the EDGAR titles (see _resolve_by_name) — but
+        only after every ticker spelling has missed, so real tickers behave
+        exactly as before. If no entity carrying this ticker files the form,
+        exit with an error naming what was found.
         """
+        raw_query = ticker
         ticker = ticker.upper().strip()
+        self.name_matched_ticker = None
         checked: list[tuple[int, str, int]] = []  # cik, name, form count
 
         def try_candidates(cands: list[tuple[int, str]]) -> tuple[int, str] | None:
@@ -177,7 +265,10 @@ class EdgarClient:
             hit = try_candidates(self._candidates_from_tickers_file(spelling))
             if not hit:
                 hit = try_candidates(self._candidates_from_exchange_file(spelling))
-            if not hit:
+            if not hit and " " not in spelling:
+                # browse-edgar is a ticker lookup; a spelling with a space
+                # is a company name, not a ticker — the name fallback below
+                # handles it (and a space would break the lookup URL).
                 browse = self._candidate_from_browse_edgar(spelling)
                 if browse:
                     hit = try_candidates([browse])
@@ -187,11 +278,9 @@ class EdgarClient:
                           f"using that spelling.", file=sys.stderr)
                 return hit
         if not checked:
-            msg = f"Ticker not found on EDGAR: {ticker}"
-            if "." in ticker or " " in ticker or len(ticker) > 5:
-                msg += (" Note: use the ticker symbol (e.g. AAPL), and for "
-                        "class shares EDGAR uses a dash (BRK-B not BRK.B).")
-            raise SystemExit(msg)
+            # Not a ticker under any spelling — retry as a company name.
+            return self._resolve_by_name(raw_query, form, min_count,
+                                         try_candidates, checked)
         found = "; ".join(f"{nm} (CIK {c}, {k} recent {form} filing(s))"
                           for c, nm, k in checked)
         raise SystemExit(

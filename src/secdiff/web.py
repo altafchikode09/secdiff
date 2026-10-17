@@ -62,13 +62,13 @@ __all__ = ["application", "main", "serve", "run_report",
 # ---------------------------------------------------------------------------
 # Form parameters (pure, unit-tested offline)
 
-_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,11}$")
+_QUERY_RE = re.compile(r"^[A-Z][A-Z0-9 .,&\-]{0,59}$")
 _FORMS = ("10-K", "10-Q")
 
 
 @dataclass
 class ReportParams:
-    ticker: str                      # upper-cased ticker symbol
+    ticker: str                      # upper-cased ticker or company name
     form: str = "10-K"
     risk_only: bool = False
     deletions_only: bool = False
@@ -86,13 +86,15 @@ def parse_report_form(data: str) -> ReportParams:
         vals = qs.get(name)
         return vals[0].strip() if vals else default
 
-    ticker = first("ticker").upper()
+    ticker = " ".join(first("ticker").upper().split())
     if not ticker:
-        raise ValueError("Please enter a ticker symbol (for example AAPL).")
-    if not _TICKER_RE.match(ticker):
+        raise ValueError("Please enter a ticker symbol or company name "
+                         "(for example AAPL or Microsoft).")
+    if not _QUERY_RE.match(ticker):
         raise ValueError(
-            f"“{ticker}” does not look like a ticker symbol. Use letters, "
-            "digits, '.' or '-' (e.g. AAPL, BRK.B).")
+            f"“{ticker}” does not look like a ticker or company name. Use "
+            "letters, digits, spaces, '.' or '-' (e.g. AAPL, BRK.B, "
+            "Berkshire Hathaway).")
     form = first("form", "10-K").upper()
     if form not in _FORMS:
         raise ValueError(f"Form must be one of: {', '.join(_FORMS)}.")
@@ -213,7 +215,7 @@ def home_page() -> str:
 <body>
 <h1>secdiff</h1>
 <p class="tagline"><strong><code>git diff</code> for SEC filings.</strong>
-Type a ticker and secdiff fetches the company's latest filing from SEC
+Type a ticker or company name and secdiff fetches the company's latest filing from SEC
 EDGAR, fetches the one before it, and shows you exactly what changed —
 words and numbers — with <strong>deleted language first</strong>, because
 what a company <em>stops saying</em> is often the story.</p>
@@ -222,9 +224,9 @@ what a company <em>stops saying</em> is often the story.</p>
 <form method="post" action="/report" id="diff-form">
   <div class="row">
     <div>
-      <label for="ticker">Ticker symbol</label>
-      <input type="text" id="ticker" name="ticker" required maxlength="12"
-             placeholder="AAPL" autocomplete="off" autocapitalize="characters">
+      <label for="ticker">Ticker or company name</label>
+      <input type="text" id="ticker" name="ticker" required maxlength="40"
+             placeholder="AAPL or Microsoft" autocomplete="off">
     </div>
     <div>
       <label for="form">Filing</label>

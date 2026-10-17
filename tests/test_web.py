@@ -41,10 +41,16 @@ def test_parse_demo_word_is_an_ordinary_ticker():
     assert p.ticker == "DEMO"
 
 
+def test_parse_company_name_is_accepted():
+    # Company names are valid input now (resolution maps them to a ticker
+    # and says so); spaces are collapsed and the value is upper-cased.
+    p = parse_report_form("ticker=Berkshire++Hathaway")
+    assert p.ticker == "BERKSHIRE HATHAWAY"
+
+
 @pytest.mark.parametrize("body", [
     "",                     # missing ticker
     "ticker=",              # blank ticker
-    "ticker=AA%20PL",       # space in ticker
     "ticker=AAPL&form=8-K",  # unsupported form
     "ticker=AAPL&top=abc",  # non-numeric top
     "ticker=AAPL&top=0",    # out-of-range top
