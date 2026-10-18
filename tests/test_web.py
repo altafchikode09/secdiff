@@ -635,3 +635,131 @@ def test_waitlist_signup_and_validation(monkeypatch, tmp_path):
     status, _text = call_app("POST", "/waitlist",
                              body=b"name=X&email=not-an-email")
     assert status.startswith("400")
+
+
+# -- owner stats page -----------------------------------------------------------
+
+@pytest.fixture()
+def stats_env(monkeypatch, tmp_path):
+    """Accounts + stats sharing one tmp DB; STATS_USERNAME=owner1."""
+    store = web.AccountStore(tmp_path / "secdiff.db")
+    monkeypatch.setattr(web, "_ACCOUNTS", store)
+    monkeypatch.setattr(web, "_STATS",
+                        web.StatsStore(tmp_path / "secdiff.db"))
+    monkeypatch.setattr(web, "_STORE", web.UsageStore(tmp_path / "u.json"))
+    monkeypatch.setenv("STATS_USERNAME", "owner1")
+    monkeypatch.setenv("SECDIFF_CACHE_DIR", str(tmp_path))
+    return store
+
+
+def _signup_as(username, email_enc):
+    body = (f"name=X&email={email_enc}&username={username}"
+            f"&password=password123").encode()
+    status, headers, _t = call_raw("POST", "/signup", body=body)
+    assert status.startswith("303"), status
+    token = _set_cookie_value(headers, "secdiff_session")
+    assert token
+    return f"secdiff_session={token}"
+
+
+def test_stats_store_event_increments(tmp_path):
+    store = web.StatsStore(tmp_path / "secdiff.db")
+    store.record("pageview")
+    store.record("pageview")
+    store.record("report", "AAPL")
+    store.record("report", "AAPL")
+    store.record("report", "MSFT")
+    store.record("signup")
+    assert store.totals() == {"visits": 0, "pageviews": 2,
+                               "reports": 3, "signups": 1}
+    assert store.top_companies() == [("AAPL", 2), ("MSFT", 1)]
+    today = store.daily(1)[0]
+    assert today["day"] == web._today_utc()
+    assert today["pageviews"] == 2 and today["reports"] == 3
+    assert today["signups"] == 1 and today["visits"] == 0
+    assert len(store.daily(14)) == 14     # a row per day, empties included
+
+
+def test_stats_store_unique_visitor_per_day(tmp_path):
+    from datetime import date, timedelta
+
+    store = web.StatsStore(tmp_path / "secdiff.db")
+    today = date.fromisoformat(web._today_utc())
+    yesterday = (today - timedelta(days=1)).isoformat()
+    today_s = today.isoformat()
+    for _ in range(3):
+        store.record_visit("visitor-one", day=today_s)
+    store.record_visit("visitor-two", day=today_s)
+    store.record_visit("visitor-one", day=yesterday)   # new day, counts again
+    assert store.totals()["visits"] == 3
+    rows = {r["day"]: r for r in store.daily(2)}
+    assert rows[today_s]["visits"] == 2
+    assert rows[yesterday]["visits"] == 1
+    # The raw cookie value is never stored — only one-way day hashes.
+    with store._db() as db:
+        hashes = [r["vhash"] for r in
+                  db.execute("SELECT vhash FROM stats_seen").fetchall()]
+    assert hashes and all("visitor" not in h for h in hashes)
+
+
+def test_stats_404_for_anonymous(stats_env):
+    status, text = call_app("GET", "/stats")
+    assert status.startswith("404")
+    assert "Page not found" in text
+
+
+def test_stats_404_for_non_owner(stats_env):
+    cookie = _signup_as("someoneelse", "other%40example.com")
+    status, text = call_app("GET", "/stats", cookie=cookie)
+    assert status.startswith("404")
+    assert "Site stats" not in text
+
+
+def test_stats_404_when_env_unset(stats_env, monkeypatch):
+    monkeypatch.delenv("STATS_USERNAME")
+    cookie = _signup_as("owner1", "owner%40example.com")
+    status, _text = call_app("GET", "/stats", cookie=cookie)
+    assert status.startswith("404")     # exists for no one
+
+
+def test_stats_owner_sees_numbers(stats_env, monkeypatch, tmp_path):
+    def fake_live(args):
+        return _fake_pipeline_result(args.ticker.upper())
+
+    monkeypatch.setattr(web, "live_pipeline", fake_live)
+    stub_resolution(monkeypatch, tmp_path, {"AAPL": 320193, "MSFT": 789019})
+    vid_a, vid_b = "aa" * 16, "bb" * 16
+    for _ in range(3):
+        call_app("GET", "/", cookie=f"secdiff_vid={vid_a}")
+    call_app("GET", "/", cookie=f"secdiff_vid={vid_b}")
+    owner_cookie = _signup_as("owner1", "owner%40example.com")
+    for t in ("AAPL", "MSFT"):
+        status, _text = call_app("POST", "/report",
+                                 body=f"ticker={t}".encode(),
+                                 cookie=owner_cookie)
+        assert status == "200 OK", t
+    status, text = call_app("GET", "/stats", cookie=owner_cookie)
+    assert status == "200 OK"
+    assert "Site stats" in text
+    today = web._today_utc()
+    # date, unique visitors, pageviews, reports, signups — in that order
+    assert (f"<tr><td>{today}</td><td>2</td><td>4</td>"
+            f"<td>2</td><td>1</td></tr>") in text
+    assert "<td>AAPL</td><td>1</td>" in text
+    assert "<td>MSFT</td><td>1</td>" in text
+    assert "<td>Accounts</td><td>1</td>" in text
+    assert "<td>Waitlist entries</td><td>0</td>" in text
+
+
+def test_stats_counting_failure_never_breaks_pages(stats_env, monkeypatch):
+    def boom():
+        raise RuntimeError("stats DB is on fire")
+
+    monkeypatch.setattr(web, "get_stats_store", boom)
+    status, text = call_app("GET", "/")
+    assert status == "200 OK"
+    assert 'name="ticker"' in text
+    # Signup recording fails silently too — the account is still created.
+    cookie = _signup_as("unlucky", "unlucky%40example.com")
+    status, text = call_app("GET", "/account", cookie=cookie)
+    assert status == "200 OK"

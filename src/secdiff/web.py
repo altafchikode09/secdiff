@@ -35,6 +35,11 @@ Design rules, same as the rest of the project:
   the paid plans take waitlist signups (name + email, stored locally)
   instead of a fake checkout, and the limit applies to everyone until
   real payments land.
+- **Owner stats.** Home visits, reports and signups are counted into
+  small daily aggregates (counts only — no IP addresses, no raw logs)
+  shown on a hidden `/stats` page visible only to the site account
+  named by the `STATS_USERNAME` environment variable; when it is unset,
+  the page does not exist for anyone.
 
 Host/port: `--host` / `--port` flags win, then the `HOST` / `PORT`
 environment variables (the convention Render/Railway/Heroku use). If
@@ -47,19 +52,21 @@ under any WSGI server (`gunicorn secdiff.web:application`) unchanged.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import io
 import json
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import threading
 import urllib.error
 import urllib.parse
 from contextlib import redirect_stderr
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -73,7 +80,8 @@ from .edgar import EdgarClient
 __all__ = ["application", "main", "serve", "run_report",
            "parse_report_form", "ReportParams", "home_page", "error_page",
            "paywall_page", "UsageStore", "FREE_DAILY_COMPANIES",
-           "AccountStore", "get_account_store"]
+           "AccountStore", "get_account_store",
+           "StatsStore", "get_stats_store", "stats_page"]
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +339,246 @@ def _header(user: dict | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Traffic stats (owner-only /stats page)
+#
+# Deliberately minimal counting, stored as daily aggregates in the SAME
+# SQLite file as the accounts (so the two are always deployed, backed
+# up and wiped together):
+#
+# - stats_events(kind, day, key, count) — 'pageview' (every home page
+#   load), 'visit' (unique visitors: bumped only the first time a
+#   visitor cookie is seen that day), 'report' (successful report
+#   generations, key = the report's ticker) and 'signup' (new accounts).
+# - stats_seen(day, vhash) — one-way hashes used ONLY to settle "have we
+#   counted this visitor today?". The hash mixes the day in, so it
+#   cannot link a visitor across days; the raw cookie value and any IP
+#   address are never stored, and rows older than yesterday are pruned.
+#
+# Counting is best-effort: every recording call is wrapped so a stats
+# failure can never break the page being served.
+
+_STATS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS stats_events (
+    kind TEXT NOT NULL,
+    day TEXT NOT NULL,
+    key TEXT NOT NULL DEFAULT '',
+    count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, day, key)
+);
+CREATE TABLE IF NOT EXISTS stats_seen (
+    day TEXT NOT NULL,
+    vhash TEXT NOT NULL,
+    PRIMARY KEY (day, vhash)
+);
+"""
+
+
+class StatsStore:
+    """Aggregated daily event counts in the accounts SQLite DB."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        with self._db() as db:
+            db.executescript(_STATS_SCHEMA)
+
+    def _db(self) -> sqlite3.Connection:
+        db = sqlite3.connect(self.path, timeout=30)
+        db.row_factory = sqlite3.Row
+        return db
+
+    @staticmethod
+    def _bump(db, kind: str, day: str, key: str, n: int = 1) -> None:
+        db.execute(
+            "INSERT INTO stats_events (kind, day, key, count) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(kind, day, key) "
+            "DO UPDATE SET count = count + excluded.count",
+            (kind, day, key, n))
+
+    def record(self, kind: str, key: str = "",
+               day: str | None = None) -> None:
+        """Atomically add one to an event counter."""
+        day = day or _today_utc()
+        with self._lock, self._db() as db:
+            self._bump(db, kind, day, key)
+            db.commit()
+
+    def record_visit(self, visitor_id: str,
+                     day: str | None = None) -> None:
+        """Count a unique daily visitor: bump 'visit' only the first
+        time this visitor is seen on `day`."""
+        day = day or _today_utc()
+        vhash = hashlib.sha256(
+            f"{day}|{visitor_id}".encode("utf-8")).hexdigest()
+        keep_from = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+        with self._lock, self._db() as db:
+            cur = db.execute(
+                "INSERT OR IGNORE INTO stats_seen (day, vhash) "
+                "VALUES (?, ?)", (day, vhash))
+            if cur.rowcount:
+                self._bump(db, "visit", day, "")
+            # Yesterday's hashes are kept for safety; anything older can
+            # never settle a "first visit today?" question again.
+            db.execute("DELETE FROM stats_seen WHERE day < ?", (keep_from,))
+            db.commit()
+
+    def daily(self, days: int = 14) -> list:
+        """Per-day rows for the last `days` days, newest first:
+        [{day, visits, pageviews, reports, signups}, ...]."""
+        today = datetime.now(timezone.utc).date()
+        since = (today - timedelta(days=days - 1)).isoformat()
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT day, kind, SUM(count) AS n FROM stats_events "
+                "WHERE day >= ? GROUP BY day, kind", (since,)).fetchall()
+        by_day: dict = {}
+        for r in rows:
+            by_day.setdefault(r["day"], {})[r["kind"]] = r["n"]
+        out = []
+        for i in range(days):
+            d = (today - timedelta(days=i)).isoformat()
+            k = by_day.get(d, {})
+            out.append({"day": d, "visits": k.get("visit", 0),
+                        "pageviews": k.get("pageview", 0),
+                        "reports": k.get("report", 0),
+                        "signups": k.get("signup", 0)})
+        return out
+
+    def totals(self) -> dict:
+        """All-time totals per kind: {visits, pageviews, reports, signups}."""
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT kind, SUM(count) AS n FROM stats_events "
+                "GROUP BY kind").fetchall()
+        d = {r["kind"]: r["n"] for r in rows}
+        return {"visits": d.get("visit", 0),
+                "pageviews": d.get("pageview", 0),
+                "reports": d.get("report", 0),
+                "signups": d.get("signup", 0)}
+
+    def top_companies(self, limit: int = 10) -> list:
+        """Most-reported companies: [(ticker, report_count), ...]."""
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT key, SUM(count) AS n FROM stats_events "
+                "WHERE kind = 'report' AND key != '' GROUP BY key "
+                "ORDER BY n DESC, key ASC LIMIT ?", (limit,)).fetchall()
+        return [(r["key"], r["n"]) for r in rows]
+
+    def total_accounts(self) -> int:
+        """Number of registered accounts (users table, same DB)."""
+        try:
+            with self._db() as db:
+                row = db.execute(
+                    "SELECT COUNT(*) AS n FROM users").fetchone()
+            return int(row["n"]) if row else 0
+        except sqlite3.Error:
+            return 0
+
+
+_STATS: StatsStore | None = None
+
+
+def get_stats_store() -> StatsStore:
+    global _STATS
+    if _STATS is None:
+        accounts = get_account_store()      # same DB file, on purpose
+        with _STORE_LOCK:
+            if _STATS is None:
+                _STATS = StatsStore(accounts.path)
+    return _STATS
+
+
+def _record(kind: str, key: str = "",
+            visitor_id: str | None = None) -> None:
+    """Best-effort stats recording. A counting failure must NEVER break
+    the request being served, so every error is swallowed here."""
+    try:
+        store = get_stats_store()
+        if kind == "visit":
+            store.record_visit(visitor_id or "")
+        else:
+            store.record(kind, key)
+    except Exception:
+        pass
+
+
+def _waitlist_count() -> int:
+    """Number of entries in waitlist.jsonl (0 when there is no file)."""
+    try:
+        text = (_cache_dir() / "waitlist.jsonl").read_text("utf-8")
+        return sum(1 for line in text.splitlines() if line.strip())
+    except OSError:
+        return 0
+
+
+def stats_page(user: dict, daily: list, totals: dict, top: list,
+               accounts_count: int, waitlist_count: int) -> str:
+    def data_row(cells) -> str:
+        return "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
+
+    day_rows = "".join(
+        data_row([html.escape(r["day"]), r["visits"], r["pageviews"],
+                  r["reports"], r["signups"]]) for r in daily)
+    if top:
+        top_rows = "".join(
+            data_row([html.escape(ticker), count])
+            for ticker, count in top)
+    else:
+        top_rows = ("<tr><td colspan='2' class='note'>"
+                    "No reports run yet.</td></tr>")
+    inner = f"""
+<h1>Site stats</h1>
+<p class="tagline">Owner-only page. Counts only — no IP addresses and
+no raw logs are stored; a unique visitor is a visitor cookie counted
+once per day.</p>
+<table class="kv">
+  <tr><td>Unique visitors (all time)</td><td>{totals['visits']}</td></tr>
+  <tr><td>Home pageviews (all time)</td><td>{totals['pageviews']}</td></tr>
+  <tr><td>Reports run (all time)</td><td>{totals['reports']}</td></tr>
+  <tr><td>Signups (all time)</td><td>{totals['signups']}</td></tr>
+  <tr><td>Accounts</td><td>{accounts_count}</td></tr>
+  <tr><td>Waitlist entries</td><td>{waitlist_count}</td></tr>
+</table>
+<h2>Last 14 days</h2>
+<table class="data">
+<tr><th>Date (UTC)</th><th>Unique visitors</th><th>Pageviews</th>
+<th>Reports</th><th>Signups</th></tr>
+{day_rows}
+</table>
+<h2>Top companies by reports</h2>
+<table class="data">
+<tr><th>Company</th><th>Reports</th></tr>
+{top_rows}
+</table>
+"""
+    return _shell("Site stats", user, inner)
+
+
+def _stats(start_response, method: str, user: dict | None):
+    """GET /stats — the owner-only traffic page.
+
+    Visible ONLY to the signed-in site account whose username matches
+    the STATS_USERNAME environment variable (case-insensitive). When the
+    variable is unset the page exists for no one; everyone else gets the
+    plain 404, so the route does not reveal itself."""
+    owner = (os.environ.get("STATS_USERNAME") or "").strip()
+    if (not owner or user is None
+            or user["username"].lower() != owner.lower()):
+        return _error(start_response, "404 Not Found", "Page not found",
+                      "There is no page at /stats.", user)
+    if method not in ("GET", "HEAD"):
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the browser.", user)
+    store = get_stats_store()
+    return _respond(start_response, "200 OK",
+                    stats_page(user, store.daily(14), store.totals(),
+                               store.top_companies(10),
+                               store.total_accounts(), _waitlist_count()))
+
+
+# ---------------------------------------------------------------------------
 # Running a report through the shared CLI pipeline
 
 _RUN_LOCK = threading.Lock()
@@ -413,6 +661,10 @@ padding:1rem 1.2rem;margin:1.2rem 0}
 table.kv{border-collapse:collapse;margin:1rem 0}
 table.kv td{padding:.35rem 1.2rem .35rem 0;vertical-align:top}
 table.kv td:first-child{font-weight:600;color:#374151}
+table.data{border-collapse:collapse;margin:1rem 0}
+table.data th,table.data td{padding:.35rem 1rem .35rem 0;text-align:left}
+table.data th{border-bottom:2px solid #e5e7eb;color:#374151}
+table.data td{border-bottom:1px solid #f3f4f6}
 button,.btn{display:inline-block;background:#2563eb;color:#fff;border:0;
 font-size:1rem;font-weight:600;padding:.65rem 1.3rem;border-radius:8px;
 cursor:pointer;text-decoration:none;margin-top:1rem}
@@ -924,6 +1176,14 @@ def _form_fields(environ) -> dict:
     return {k: (v[0].strip() if v else "") for k, v in qs.items()}
 
 
+def _report_key(summary: str, params: ReportParams) -> str:
+    """Stats key for a finished report: the real ticker out of the
+    pipeline's one-line summary ("AAPL 10-K: …"), falling back to what
+    the visitor typed."""
+    tokens = (summary or "").split()
+    return tokens[0] if tokens else params.ticker
+
+
 def _usage_key(user: dict | None, visitor_id: str) -> str:
     """Daily-limit identity: the account (by username) when logged in —
     so the count follows the user across devices — else the guest
@@ -985,8 +1245,9 @@ def application(environ, start_response):
     """WSGI app: / (search form + pricing), /report (POST form or GET
     query), /waitlist (POST), the account pages (/signup, /login,
     /logout, /account, /change-password, /forgot-password,
-    /forgot-username), /healthz. All other paths 404; all failures are
-    honest error pages."""
+    /forgot-username), the owner-only /stats (404 for everyone but the
+    STATS_USERNAME account), /healthz. All other paths 404; all failures
+    are honest error pages."""
     method = (environ.get("REQUEST_METHOD") or "GET").upper()
     path = environ.get("PATH_INFO") or "/"
     visitor_id, visitor_is_new = _visitor_id(environ)
@@ -1007,6 +1268,8 @@ def application(environ, start_response):
                 notice = (f"Welcome, {user['username']} — your account is "
                           "ready. Your daily free companies now follow "
                           "this account on any device.")
+            _record("pageview")
+            _record("visit", visitor_id=visitor_id)
             return _respond(start_response, "200 OK",
                             home_page(user, notice), extra_headers=cookie)
         if path == "/healthz":
@@ -1047,6 +1310,8 @@ def application(environ, start_response):
             return _forgot_password(environ, start_response, method)
         if path == "/forgot-username":
             return _forgot_username(environ, start_response, method)
+        if path == "/stats":
+            return _stats(start_response, method, user)
         if path == "/report":
             if method == "POST":
                 raw = _read_body(environ)
@@ -1064,7 +1329,8 @@ def application(environ, start_response):
                     _usage_key(user, visitor_id), cik):
                 return _respond(start_response, "402 Payment Required",
                                 paywall_page(user), extra_headers=cookie)
-            _summary, page = run_report(params, user)
+            summary, page = run_report(params, user)
+            _record("report", _report_key(summary, params))
             return _respond(start_response, "200 OK", page,
                             extra_headers=cookie)
         return _error(start_response, "404 Not Found", "Page not found",
@@ -1123,6 +1389,7 @@ def _signup(environ, start_response, method, user, cookie):
     except ValueError as exc:
         return fail(str(exc))
     token = store.create_session(new_user["id"])
+    _record("signup")
     return _redirect(start_response, "/?welcome=1",
                      [_session_cookie_header(token), *cookie])
 
