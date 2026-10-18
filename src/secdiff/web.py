@@ -65,12 +65,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
+from . import accounts as _accounts
+from .accounts import AccountStore
 from .cli import live_pipeline, one_line_summary, render_reports
 from .edgar import EdgarClient
 
 __all__ = ["application", "main", "serve", "run_report",
            "parse_report_form", "ReportParams", "home_page", "error_page",
-           "paywall_page", "UsageStore", "FREE_DAILY_COMPANIES"]
+           "paywall_page", "UsageStore", "FREE_DAILY_COMPANIES",
+           "AccountStore", "get_account_store"]
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +258,79 @@ def _cookie_header(visitor_id: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# User accounts (signup / login / sessions / recovery)
+#
+# Accounts live in a SQLite DB (secdiff.db in the cache dir) via
+# secdiff.accounts. Being logged in changes two things: the header shows
+# the account links, and the daily free-company counter is keyed by
+# username instead of the guest cookie, so it follows the user across
+# devices. Paid plans exist as a plan field on the account but do NOT
+# unlock anything yet — payments are a later phase, and the free limit
+# applies to accounts exactly as it does to guests.
+
+_SESSION_COOKIE = "secdiff_session"
+_ACCOUNTS: AccountStore | None = None
+
+
+def get_account_store() -> AccountStore:
+    global _ACCOUNTS
+    with _STORE_LOCK:
+        if _ACCOUNTS is None:
+            _ACCOUNTS = AccountStore(_cache_dir() / "secdiff.db")
+        return _ACCOUNTS
+
+
+def _cookies(environ) -> SimpleCookie:
+    jar = SimpleCookie()
+    raw = environ.get("HTTP_COOKIE", "")
+    if raw:
+        try:
+            jar.load(raw)
+        except Exception:
+            jar = SimpleCookie()
+    return jar
+
+
+def _session_token(environ) -> str:
+    morsel = _cookies(environ).get(_SESSION_COOKIE)
+    return morsel.value if morsel is not None else ""
+
+
+def _current_user(environ) -> dict | None:
+    token = _session_token(environ)
+    if not token:
+        return None
+    return get_account_store().user_for_session(token)
+
+
+def _session_cookie_header(token: str) -> tuple[str, str]:
+    return ("Set-Cookie",
+            f"{_SESSION_COOKIE}={token}; Path=/; Max-Age=2592000; "
+            "HttpOnly; SameSite=Lax")
+
+
+def _clear_session_cookie_header() -> tuple[str, str]:
+    return ("Set-Cookie",
+            f"{_SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+
+
+def _header(user: dict | None) -> str:
+    """Top bar shown on every page: brand + account links."""
+    if user:
+        nav = (f"<span>Hi, <strong>{html.escape(user['username'])}</strong>"
+               "</span>"
+               "<a href='/account'>My account</a>"
+               "<form method='post' action='/logout' style='display:inline'>"
+               "<button type='submit' class='linkbtn'>Log out</button>"
+               "</form>")
+    else:
+        nav = ("<a href='/login'>Log in</a>"
+               "<a class='btn' href='/signup'>Create account</a>")
+    return (f"<header class='topbar'><a class='brand' href='/'>secdiff</a>"
+            f"<nav>{nav}</nav></header>")
+
+
+# ---------------------------------------------------------------------------
 # Running a report through the shared CLI pipeline
 
 _RUN_LOCK = threading.Lock()
@@ -272,7 +348,8 @@ def _cli_args(params: ReportParams) -> SimpleNamespace:
         output="secdiff-out")
 
 
-def run_report(params: ReportParams) -> tuple[str, str]:
+def run_report(params: ReportParams,
+               user: dict | None = None) -> tuple[str, str]:
     """Compute a report with the shared pipeline.
 
     Returns (one_line_summary, full_html_page). Pipeline failures
@@ -286,14 +363,18 @@ def run_report(params: ReportParams) -> tuple[str, str]:
         info, diffs, xbrl = live_pipeline(args)
         _md, page, counts = render_reports(args, info, diffs, xbrl)
     summary = one_line_summary(info, counts, xbrl)
-    return summary, _wrap_report(page, notes.getvalue().strip())
+    return summary, _wrap_report(page, notes.getvalue().strip(), user)
 
 
-def _wrap_report(report_html: str, notes: str) -> str:
+def _wrap_report(report_html: str, notes: str,
+                 user: dict | None = None) -> str:
     """Add a way back home (and any honest stderr notes, e.g. the ticker
     resolved to a different EDGAR entity) to the shared report page."""
+    account_link = ("<a href='/account'>My account</a>" if user
+                    else "<a href='/login'>Log in</a>")
     nav = ("<div style='max-width:920px;margin:1rem auto 0;padding:0 1rem'>"
-           "<a href='/'>&larr; New secdiff search</a></div>")
+           "<a href='/'>&larr; New secdiff search</a>"
+           f" &nbsp;·&nbsp; {account_link}</div>")
     if notes:
         items = "".join(f"<div>{html.escape(line)}</div>"
                         for line in notes.splitlines() if line.strip())
@@ -318,8 +399,20 @@ h2{margin-top:2.2rem;border-bottom:2px solid #e5e7eb;padding-bottom:.3rem}
 .card{background:#f3f4f6;border-radius:10px;padding:1.2rem 1.4rem;margin:1.2rem 0}
 label{display:block;font-weight:600;margin:.7rem 0 .2rem}
 label.check{font-weight:400}
-input[type=text],input[type=number],select{font-size:1rem;padding:.5rem .6rem;
+input[type=text],input[type=number],input[type=email],input[type=password],select{font-size:1rem;padding:.5rem .6rem;
 border:1px solid #d1d5db;border-radius:6px;width:100%;box-sizing:border-box}
+.topbar{display:flex;justify-content:space-between;align-items:center;
+gap:1rem;margin-bottom:1.4rem}
+.topbar .brand{font-weight:800;font-size:1.3rem;text-decoration:none;color:#1a1a2e}
+.topbar nav{display:flex;gap:.9rem;align-items:center}
+.topbar nav .btn{margin-top:0;padding:.45rem .95rem}
+.linkbtn{background:none;border:0;color:#2563eb;cursor:pointer;
+font-size:1rem;padding:0;text-decoration:underline;margin-top:0;font-weight:400}
+.ok{background:#f0fdf4;border-left:4px solid #16a34a;border-radius:6px;
+padding:1rem 1.2rem;margin:1.2rem 0}
+table.kv{border-collapse:collapse;margin:1rem 0}
+table.kv td{padding:.35rem 1.2rem .35rem 0;vertical-align:top}
+table.kv td:first-child{font-weight:600;color:#374151}
 button,.btn{display:inline-block;background:#2563eb;color:#fff;border:0;
 font-size:1rem;font-weight:600;padding:.65rem 1.3rem;border-radius:8px;
 cursor:pointer;text-decoration:none;margin-top:1rem}
@@ -356,12 +449,16 @@ document.getElementById('diff-form').addEventListener('submit', function () {
 """
 
 
-def home_page() -> str:
+def home_page(user: dict | None = None, notice: str = "") -> str:
+    notice_html = (f"<div class='ok'><p>{html.escape(notice)}</p></div>"
+                   if notice else "")
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>secdiff — git diff for SEC filings</title><style>{_CSS}</style></head>
 <body>
+{_header(user)}
+{notice_html}
 <h1>secdiff</h1>
 <p class="tagline"><strong><code>git diff</code> for SEC filings.</strong>
 Type a ticker or company name and secdiff fetches the company's latest filing from SEC
@@ -502,12 +599,13 @@ def pricing_section() -> str:
 """
 
 
-def paywall_page() -> str:
+def paywall_page(user: dict | None = None) -> str:
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>secdiff — daily free limit reached</title><style>{_CSS}</style></head>
 <body>
+{_header(user)}
 <h1>You've used today's 4 free companies</h1>
 <p class="tagline">The free plan covers <strong>4 different companies per
 day</strong>, with full reports. You've reached today's limit — companies
@@ -523,12 +621,13 @@ Data: SEC EDGAR (public filings).</p></footer>
 """
 
 
-def waitlist_thanks_page() -> str:
+def waitlist_thanks_page(user: dict | None = None) -> str:
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>secdiff — you're on the waitlist</title><style>{_CSS}</style></head>
 <body>
+{_header(user)}
 <h1>You're on the waitlist ✅</h1>
 <p class="tagline">Thanks — we'll email you when the Weekly ($9) and
 Monthly ($27) plans open for payment.</p>
@@ -539,12 +638,13 @@ Data: SEC EDGAR (public filings).</p></footer>
 """
 
 
-def error_page(title: str, message: str) -> str:
+def error_page(title: str, message: str, user: dict | None = None) -> str:
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>secdiff — {html.escape(title)}</title><style>{_CSS}</style></head>
 <body>
+{_header(user)}
 <h1>{html.escape(title)}</h1>
 <div class="err"><p>{html.escape(message)}</p></div>
 <p class="note">No report was generated and nothing was filled in or
@@ -555,6 +655,245 @@ instead of a made-up result.</p>
 Data: SEC EDGAR (public filings).</p></footer>
 </body></html>
 """
+
+
+# ---------------------------------------------------------------------------
+# Account pages
+
+def _shell(title: str, user: dict | None, inner: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>secdiff — {html.escape(title)}</title><style>{_CSS}</style></head>
+<body>
+{_header(user)}
+{inner}
+<footer><p class="note"><strong>Not investment advice.</strong>
+Data: SEC EDGAR (public filings).</p></footer>
+</body></html>
+"""
+
+
+def _form_error(message: str) -> str:
+    return (f"<div class='err'><p>{html.escape(message, quote=False)}</p></div>"
+            if message else "")
+
+
+def signup_page(error: str = "", name: str = "", email: str = "",
+                username: str = "") -> str:
+    inner = f"""
+<h1>Create your account</h1>
+<p class="tagline">One account works on every device — your daily free
+companies follow you. Paid plans (Weekly $9, Monthly $27) open soon.</p>
+{_form_error(error)}
+<div class="card">
+<form method="post" action="/signup">
+  <label for="su-name">Your name <span class="note">(optional)</span></label>
+  <input type="text" id="su-name" name="name" maxlength="80"
+         value="{html.escape(name, quote=True)}" autocomplete="name">
+  <label for="su-email">Email</label>
+  <input type="email" id="su-email" name="email" required maxlength="120"
+         value="{html.escape(email, quote=True)}" autocomplete="email"
+         placeholder="you@example.com">
+  <label for="su-username">Username</label>
+  <input type="text" id="su-username" name="username" required maxlength="30"
+         value="{html.escape(username, quote=True)}" autocomplete="username"
+         placeholder="3–30 characters: letters, digits, . _ -">
+  <label for="su-password">Password</label>
+  <input type="password" id="su-password" name="password" required
+         minlength="8" autocomplete="new-password"
+         placeholder="At least 8 characters">
+  <button type="submit">Create account</button>
+</form>
+</div>
+<p>Already have an account? <a href="/login">Log in</a> ·
+<a href="/forgot-username">Forgot your username?</a></p>
+"""
+    return _shell("Create account", None, inner)
+
+
+def login_page(error: str = "", identifier: str = "") -> str:
+    inner = f"""
+<h1>Log in</h1>
+{_form_error(error)}
+<div class="card">
+<form method="post" action="/login">
+  <label for="li-id">Username or email</label>
+  <input type="text" id="li-id" name="identifier" required maxlength="120"
+         value="{html.escape(identifier, quote=True)}"
+         autocomplete="username">
+  <label for="li-password">Password</label>
+  <input type="password" id="li-password" name="password" required
+         autocomplete="current-password">
+  <button type="submit">Log in</button>
+</form>
+</div>
+<p><a href="/forgot-password">Forgot your password?</a> ·
+<a href="/forgot-username">Forgot your username?</a></p>
+<p>New here? <a href="/signup">Create an account</a> — free.</p>
+"""
+    return _shell("Log in", None, inner)
+
+
+_PLAN_LABELS = {"free": "Free — $0",
+                "weekly": "Weekly — $9 / week",
+                "monthly": "Monthly — $27 / month"}
+
+
+def account_page(user: dict, used_today: int, message: str = "",
+                 error: str = "") -> str:
+    plan = _PLAN_LABELS.get(user.get("plan") or "free", "Free — $0")
+    ok = (f"<div class='ok'><p>{html.escape(message)}</p></div>"
+          if message else "")
+    inner = f"""
+<h1>My account</h1>
+{ok}{_form_error(error)}
+<table class="kv">
+  <tr><td>Username</td><td>{html.escape(user['username'])}</td></tr>
+  <tr><td>Email</td><td>{html.escape(user['email'])}</td></tr>
+  <tr><td>Plan</td><td>{html.escape(plan)}</td></tr>
+  <tr><td>Today</td><td>{used_today} of {FREE_DAILY_COMPANIES} free companies used</td></tr>
+</table>
+<p class="note">Paid plans (Weekly $9, Monthly $27 — unlimited companies)
+are <strong>opening soon</strong>; until payments go live, every account
+gets the same 4 free companies a day as guests.</p>
+
+<h2>Change password</h2>
+<div class="card">
+<form method="post" action="/change-password">
+  <label for="cp-current">Current password</label>
+  <input type="password" id="cp-current" name="current_password" required
+         autocomplete="current-password">
+  <label for="cp-new">New password</label>
+  <input type="password" id="cp-new" name="new_password" required
+         minlength="8" autocomplete="new-password"
+         placeholder="At least 8 characters">
+  <button type="submit">Change password</button>
+</form>
+</div>
+<form method="post" action="/logout">
+  <button type="submit" class="btn secondary">Log out</button>
+</form>
+"""
+    return _shell("My account", user, inner)
+
+
+def forgot_password_page(error: str = "", notice: str = "") -> str:
+    note = (f"<div class='ok'><p>{html.escape(notice)}</p></div>"
+            if notice else "")
+    inner = f"""
+<h1>Forgot your password?</h1>
+<p class="tagline">Enter your email address or username and we'll email
+you a 6-digit code to set a new password.</p>
+{note}{_form_error(error)}
+<div class="card">
+<form method="post" action="/forgot-password">
+  <input type="hidden" name="step" value="request">
+  <label for="fp-id">Email or username</label>
+  <input type="text" id="fp-id" name="identifier" required maxlength="120"
+         autocomplete="username">
+  <button type="submit">Email me a code</button>
+</form>
+</div>
+<p><a href="/login">&larr; Back to log in</a></p>
+"""
+    return _shell("Forgot password", None, inner)
+
+
+def forgot_password_code_page(identifier: str, notice: str,
+                                error: str = "") -> str:
+    note = (f"<div class='ok'><p>{html.escape(notice)}</p></div>"
+            if notice else "")
+    inner = f"""
+<h1>Enter your reset code</h1>
+{note}{_form_error(error)}
+<div class="card">
+<form method="post" action="/forgot-password">
+  <input type="hidden" name="step" value="reset">
+  <input type="hidden" name="identifier"
+         value="{html.escape(identifier, quote=True)}">
+  <label for="fp-code">6-digit code from your email</label>
+  <input type="text" id="fp-code" name="code" required maxlength="6"
+         inputmode="numeric" autocomplete="one-time-code"
+         placeholder="123456">
+  <label for="fp-new">New password</label>
+  <input type="password" id="fp-new" name="new_password" required
+         minlength="8" autocomplete="new-password"
+         placeholder="At least 8 characters">
+  <button type="submit">Set new password</button>
+</form>
+</div>
+<p class="note">Codes expire after 10 minutes and can be used once.
+No code? <a href="/forgot-password">Request a new one</a>.</p>
+"""
+    return _shell("Enter reset code", None, inner)
+
+
+def password_reset_done_page() -> str:
+    inner = """
+<h1>Password changed ✅</h1>
+<div class="ok"><p>Your password has been reset and you have been logged
+out everywhere. Log in with your new password to continue.</p></div>
+<p><a class="btn" href="/login">Log in</a></p>
+"""
+    return _shell("Password changed", None, inner)
+
+
+def forgot_username_page(error: str = "", notice: str = "") -> str:
+    note = (f"<div class='ok'><p>{html.escape(notice)}</p></div>"
+            if notice else "")
+    inner = f"""
+<h1>Forgot your username?</h1>
+<p class="tagline">Enter the email address on your account and we'll
+email you a 6-digit code; enter it here and we'll show your username.</p>
+{note}{_form_error(error)}
+<div class="card">
+<form method="post" action="/forgot-username">
+  <input type="hidden" name="step" value="request">
+  <label for="fu-email">Email</label>
+  <input type="email" id="fu-email" name="email" required maxlength="120"
+         autocomplete="email" placeholder="you@example.com">
+  <button type="submit">Email me a code</button>
+</form>
+</div>
+<p><a href="/login">&larr; Back to log in</a></p>
+"""
+    return _shell("Forgot username", None, inner)
+
+
+def forgot_username_code_page(email: str, notice: str,
+                                error: str = "") -> str:
+    note = (f"<div class='ok'><p>{html.escape(notice)}</p></div>"
+            if notice else "")
+    inner = f"""
+<h1>Enter your code</h1>
+{note}{_form_error(error)}
+<div class="card">
+<form method="post" action="/forgot-username">
+  <input type="hidden" name="step" value="verify">
+  <input type="hidden" name="email"
+         value="{html.escape(email, quote=True)}">
+  <label for="fu-code">6-digit code from your email</label>
+  <input type="text" id="fu-code" name="code" required maxlength="6"
+         inputmode="numeric" autocomplete="one-time-code"
+         placeholder="123456">
+  <button type="submit">Show my username</button>
+</form>
+</div>
+<p class="note">Codes expire after 10 minutes and can be used once.
+No code? <a href="/forgot-username">Request a new one</a>.</p>
+"""
+    return _shell("Enter code", None, inner)
+
+
+def username_revealed_page(username: str) -> str:
+    inner = f"""
+<h1>Your username</h1>
+<div class="ok"><p>Your secdiff username is
+<strong>{html.escape(username)}</strong>.</p></div>
+<p><a class="btn" href="/login">Log in</a></p>
+"""
+    return _shell("Your username", None, inner)
 
 
 # ---------------------------------------------------------------------------
@@ -570,8 +909,46 @@ def _respond(start_response, status: str, body,
     return [data]
 
 
-def _error(start_response, status: str, title: str, message: str):
-    return _respond(start_response, status, error_page(title, message))
+def _error(start_response, status: str, title: str, message: str,
+           user: dict | None = None):
+    return _respond(start_response, status, error_page(title, message, user))
+
+
+def _redirect(start_response, location: str, extra_headers=()):
+    return _respond(start_response, "303 See Other", "",
+                    extra_headers=[("Location", location), *extra_headers])
+
+
+def _form_fields(environ) -> dict:
+    qs = urllib.parse.parse_qs(_read_body(environ), keep_blank_values=True)
+    return {k: (v[0].strip() if v else "") for k, v in qs.items()}
+
+
+def _usage_key(user: dict | None, visitor_id: str) -> str:
+    """Daily-limit identity: the account (by username) when logged in —
+    so the count follows the user across devices — else the guest
+    visitor cookie."""
+    return f"user:{user['username'].lower()}" if user else visitor_id
+
+
+def _start_recovery(store: AccountStore, user: dict | None,
+                    purpose: str) -> tuple[str, bool]:
+    """Issue + email a recovery code. Returns (notice_for_visitor,
+    code_page_expected). Anti-enumeration: an unknown identifier gets
+    the same generic notice as a delivered code. When the account
+    exists but mail is unconfigured/failed, the notice honestly says
+    email delivery is not switched on yet; the code is never shown."""
+    generic = ("If an account matches, a 6-digit code is on its way to "
+               "that email address. It expires in 10 minutes.")
+    if user is None:
+        return generic, True
+    code = store.issue_code(user["id"], purpose)
+    if _accounts.deliver_code(user, code, purpose):
+        return generic, True
+    return ("Email delivery is not switched on for this site yet, so "
+            "your code could not be sent. Please try again later — the "
+            "account itself is fine, and no code is shown here for "
+            "security reasons."), True
 
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -606,29 +983,70 @@ def _read_body(environ) -> str:
 
 def application(environ, start_response):
     """WSGI app: / (search form + pricing), /report (POST form or GET
-    query), /waitlist (POST), /healthz. All other paths 404; all
-    failures are honest error pages."""
+    query), /waitlist (POST), the account pages (/signup, /login,
+    /logout, /account, /change-password, /forgot-password,
+    /forgot-username), /healthz. All other paths 404; all failures are
+    honest error pages."""
     method = (environ.get("REQUEST_METHOD") or "GET").upper()
     path = environ.get("PATH_INFO") or "/"
     visitor_id, visitor_is_new = _visitor_id(environ)
     cookie = [_cookie_header(visitor_id)] if visitor_is_new else []
     try:
+        user = _current_user(environ)
+    except Exception:                       # accounts must never break the site
+        user = None
+    try:
         if path in ("/", "/index.html"):
             if method not in ("GET", "HEAD"):
                 return _error(start_response, "405 Method Not Allowed",
-                              "Method not allowed", "Use the search form.")
-            return _respond(start_response, "200 OK", home_page(),
-                            extra_headers=cookie)
+                              "Method not allowed", "Use the search form.",
+                              user)
+            notice = ""
+            qs = urllib.parse.parse_qs(environ.get("QUERY_STRING", ""))
+            if (qs.get("welcome") or [""])[0] == "1" and user:
+                notice = (f"Welcome, {user['username']} — your account is "
+                          "ready. Your daily free companies now follow "
+                          "this account on any device.")
+            return _respond(start_response, "200 OK",
+                            home_page(user, notice), extra_headers=cookie)
         if path == "/healthz":
             return _respond(start_response, "200 OK", "ok\n",
                             "text/plain; charset=utf-8")
         if path == "/waitlist":
             if method != "POST":
-                return _respond(start_response, "303 See Other", "",
-                                extra_headers=[("Location", "/#waitlist")])
+                return _redirect(start_response, "/#waitlist")
             _join_waitlist(_read_body(environ))
-            return _respond(start_response, "200 OK", waitlist_thanks_page(),
+            return _respond(start_response, "200 OK",
+                            waitlist_thanks_page(user),
                             extra_headers=cookie)
+        if path == "/signup":
+            return _signup(environ, start_response, method, user, cookie)
+        if path == "/login":
+            return _login(environ, start_response, method, user, cookie)
+        if path == "/logout":
+            if method == "POST":
+                token = _session_token(environ)
+                if token:
+                    get_account_store().delete_session(token)
+            return _redirect(start_response, "/",
+                             [_clear_session_cookie_header()])
+        if path == "/account":
+            if user is None:
+                return _redirect(start_response, "/login")
+            if method not in ("GET", "HEAD"):
+                return _error(start_response, "405 Method Not Allowed",
+                              "Method not allowed", "Use the form.", user)
+            used = len(get_usage_store().companies_today(
+                _usage_key(user, visitor_id)))
+            return _respond(start_response, "200 OK",
+                            account_page(user, used))
+        if path == "/change-password":
+            return _change_password(environ, start_response, method, user,
+                                    visitor_id)
+        if path == "/forgot-password":
+            return _forgot_password(environ, start_response, method)
+        if path == "/forgot-username":
+            return _forgot_username(environ, start_response, method)
         if path == "/report":
             if method == "POST":
                 raw = _read_body(environ)
@@ -636,37 +1054,194 @@ def application(environ, start_response):
                 raw = environ.get("QUERY_STRING", "")
             else:
                 return _error(start_response, "405 Method Not Allowed",
-                              "Method not allowed", "Use the search form.")
+                              "Method not allowed", "Use the search form.",
+                              user)
             params = parse_report_form(raw)
             # Resolve FIRST: an unknown ticker errors out here (the usual
             # honest error page) and never consumes a free slot.
             cik, _company = _resolve_company(params)
-            if not get_usage_store().check_and_add(visitor_id, cik):
+            if not get_usage_store().check_and_add(
+                    _usage_key(user, visitor_id), cik):
                 return _respond(start_response, "402 Payment Required",
-                                paywall_page(), extra_headers=cookie)
-            _summary, page = run_report(params)
+                                paywall_page(user), extra_headers=cookie)
+            _summary, page = run_report(params, user)
             return _respond(start_response, "200 OK", page,
                             extra_headers=cookie)
         return _error(start_response, "404 Not Found", "Page not found",
-                      f"There is no page at {path}.")
+                      f"There is no page at {path}.", user)
     except ValueError as exc:                       # bad form input
         return _error(start_response, "400 Bad Request",
-                      "Check the form", str(exc))
+                      "Check the form", str(exc), user)
     except SystemExit as exc:                       # pipeline's honest errors
         msg = str(exc.code) if exc.code else "The request could not be completed."
         return _error(start_response, "400 Bad Request",
-                      "No report could be built", msg)
+                      "No report could be built", msg, user)
     except urllib.error.URLError as exc:           # EDGAR unreachable
         reason = getattr(exc, "reason", exc)
         return _error(start_response, "502 Bad Gateway",
                       "SEC EDGAR could not be reached",
                       f"EDGAR did not answer ({reason}). Nothing was fetched, "
                       "so there is no report to show — please try again in "
-                      "a moment.")
+                      "a moment.", user)
     except Exception as exc:                        # never leak a stack trace
         return _error(start_response, "500 Internal Server Error",
                       "Something went wrong",
-                      f"Building the report failed: {exc}")
+                      f"Building the report failed: {exc}", user)
+
+
+# -- account route handlers ---------------------------------------------------
+
+def _signup(environ, start_response, method, user, cookie):
+    if user is not None:
+        return _redirect(start_response, "/account")
+    if method in ("GET", "HEAD"):
+        return _respond(start_response, "200 OK", signup_page(),
+                        extra_headers=cookie)
+    if method != "POST":
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the form.")
+    f = _form_fields(environ)
+    name, email = f.get("name", ""), f.get("email", "")
+    username, password = f.get("username", ""), f.get("password", "")
+
+    def fail(msg):
+        return _respond(start_response, "400 Bad Request",
+                        signup_page(msg, name, email, username),
+                        extra_headers=cookie)
+
+    if not _accounts.USERNAME_RE.match(username):
+        return fail("Usernames are 3–30 characters: letters, digits, "
+                    "'.', '_' or '-'.")
+    if not _accounts.EMAIL_RE.match(email):
+        return fail("That email address doesn't look right — please "
+                    "check it and try again.")
+    if len(password) < 8:
+        return fail("Please choose a password of at least 8 characters.")
+    store = get_account_store()
+    try:
+        new_user = store.create_user(username, email, password, name)
+    except ValueError as exc:
+        return fail(str(exc))
+    token = store.create_session(new_user["id"])
+    return _redirect(start_response, "/?welcome=1",
+                     [_session_cookie_header(token), *cookie])
+
+
+def _login(environ, start_response, method, user, cookie):
+    if user is not None:
+        return _redirect(start_response, "/account")
+    if method in ("GET", "HEAD"):
+        return _respond(start_response, "200 OK", login_page(),
+                        extra_headers=cookie)
+    if method != "POST":
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the form.")
+    f = _form_fields(environ)
+    identifier, password = f.get("identifier", ""), f.get("password", "")
+    store = get_account_store()
+    found = store.find_for_login(identifier) if identifier else None
+    if found is None or not store.check_password(found, password):
+        # Never reveal which part failed.
+        return _respond(start_response, "401 Unauthorized",
+                        login_page("That username/email and password "
+                                   "don't match our records — please try "
+                                   "again.", identifier),
+                        extra_headers=cookie)
+    token = store.create_session(found["id"])
+    return _redirect(start_response, "/",
+                     [_session_cookie_header(token), *cookie])
+
+
+def _change_password(environ, start_response, method, user, visitor_id):
+    if user is None:
+        return _redirect(start_response, "/login")
+    if method != "POST":
+        return _redirect(start_response, "/account")
+    store = get_account_store()
+    used = len(get_usage_store().companies_today(
+        _usage_key(user, visitor_id)))
+
+    def show(message="", error=""):
+        return _respond(start_response,
+                        "400 Bad Request" if error else "200 OK",
+                        account_page(user, used, message, error))
+
+    f = _form_fields(environ)
+    if not store.check_password(user, f.get("current_password", "")):
+        return show(error="Your current password doesn't match — the "
+                          "password was not changed.")
+    new_pw = f.get("new_password", "")
+    if len(new_pw) < 8:
+        return show(error="Please choose a new password of at least 8 "
+                          "characters.")
+    store.set_password(user["id"], new_pw)
+    # Other devices are logged out; this session stays.
+    store.delete_user_sessions(user["id"],
+                               except_token=_session_token(environ))
+    return show(message="Your password has been changed.")
+
+
+def _forgot_password(environ, start_response, method):
+    if method in ("GET", "HEAD"):
+        return _respond(start_response, "200 OK", forgot_password_page())
+    if method != "POST":
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the form.")
+    f = _form_fields(environ)
+    store = get_account_store()
+    identifier = f.get("identifier", "")
+    if f.get("step") == "reset":
+        found = store.find_for_recovery(identifier) if identifier else None
+        new_pw = f.get("new_password", "")
+        if len(new_pw) < 8:
+            return _respond(start_response, "400 Bad Request",
+                            forgot_password_code_page(
+                                identifier, "",
+                                "Please choose a new password of at "
+                                "least 8 characters."))
+        if found is None or not store.verify_code(
+                found["id"], _accounts.PURPOSE_PASSWORD,
+                f.get("code", "")):
+            return _respond(start_response, "400 Bad Request",
+                            forgot_password_code_page(
+                                identifier, "",
+                                "That code isn't right, or it has "
+                                "expired — please check it or request a "
+                                "new one."))
+        store.set_password(found["id"], new_pw)
+        store.delete_user_sessions(found["id"])   # log out everywhere
+        return _respond(start_response, "200 OK", password_reset_done_page())
+    found = store.find_for_recovery(identifier) if identifier else None
+    notice, _ = _start_recovery(store, found, _accounts.PURPOSE_PASSWORD)
+    return _respond(start_response, "200 OK",
+                    forgot_password_code_page(identifier, notice))
+
+
+def _forgot_username(environ, start_response, method):
+    if method in ("GET", "HEAD"):
+        return _respond(start_response, "200 OK", forgot_username_page())
+    if method != "POST":
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the form.")
+    f = _form_fields(environ)
+    store = get_account_store()
+    email = f.get("email", "")
+    if f.get("step") == "verify":
+        found = store.get_by_email(email) if email else None
+        if found is None or not store.verify_code(
+                found["id"], _accounts.PURPOSE_USERNAME, f.get("code", "")):
+            return _respond(start_response, "400 Bad Request",
+                            forgot_username_code_page(
+                                email, "",
+                                "That code isn't right, or it has "
+                                "expired — please check it or request a "
+                                "new one."))
+        return _respond(start_response, "200 OK",
+                        username_revealed_page(found["username"]))
+    found = store.get_by_email(email) if email else None
+    notice, _ = _start_recovery(store, found, _accounts.PURPOSE_USERNAME)
+    return _respond(start_response, "200 OK",
+                    forgot_username_code_page(email, notice))
 
 
 # ---------------------------------------------------------------------------

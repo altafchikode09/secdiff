@@ -308,6 +308,322 @@ def test_fifth_distinct_company_gets_paywall(monkeypatch, tmp_path):
     assert status == "200 OK"
 
 
+def call_raw(method, path, query="", body=b"", cookie=""):
+    """Like call_app but returns the raw (status, headers-list, text) so
+    tests can see multiple Set-Cookie headers."""
+    environ = {
+        "REQUEST_METHOD": method,
+        "PATH_INFO": path,
+        "QUERY_STRING": query,
+        "CONTENT_LENGTH": str(len(body)),
+        "HTTP_COOKIE": cookie,
+        "wsgi.input": io.BytesIO(body),
+    }
+    captured = {}
+
+    def start_response(status, headers, exc_info=None):
+        captured["status"] = status
+        captured["headers"] = headers
+
+    chunks = application(environ, start_response)
+    text = b"".join(chunks).decode("utf-8")
+    return captured["status"], captured["headers"], text
+
+
+def _set_cookie_value(headers, name):
+    for k, v in headers:
+        if k == "Set-Cookie" and v.startswith(name + "="):
+            return v.split(";")[0].split("=", 1)[1]
+    return None
+
+
+@pytest.fixture()
+def accounts_env(monkeypatch, tmp_path):
+    """Isolated account store + usage store + capturing mail stub.
+
+    Returns (store, sent) where sent collects (to, subject, body) of
+    every email the mailer was asked to send."""
+    import re as _re
+
+    import secdiff.accounts as accounts_mod
+
+    store = web.AccountStore(tmp_path / "secdiff.db")
+    monkeypatch.setattr(web, "_ACCOUNTS", store)
+    monkeypatch.setattr(web, "_STORE", web.UsageStore(tmp_path / "u.json"))
+    sent = []
+
+    def fake_send(to, subject, body):
+        sent.append((to, subject, body))
+        return True
+
+    monkeypatch.setattr(accounts_mod, "send_email", fake_send)
+
+    def last_code():
+        m = _re.search(r"is: (\d{6})", sent[-1][2])
+        return m.group(1)
+
+    return store, sent, last_code
+
+
+def _signup(body=b"name=Test+User&email=test%40example.com"
+            b"&username=testuser&password=password123"):
+    return call_raw("POST", "/signup", body=body)
+
+
+def test_signup_happy_path_logs_you_in(accounts_env):
+    status, headers, _text = _signup()
+    assert status.startswith("303")
+    token = _set_cookie_value(headers, "secdiff_session")
+    assert token
+    status, text = call_app("GET", "/", cookie=f"secdiff_session={token}")
+    assert status == "200 OK"
+    assert "Hi, <strong>testuser</strong>" in text
+    assert "My account" in text
+
+
+def test_signup_duplicate_username_and_email_rejected(accounts_env):
+    _signup()
+    status, _h, text = _signup(
+        b"email=other%40example.com&username=testuser"
+        b"&password=password123")
+    assert status.startswith("400")
+    assert "username is already taken" in text
+    status, _h, text = _signup(
+        b"email=test%40example.com&username=someoneelse"
+        b"&password=password123")
+    assert status.startswith("400")
+    assert "already exists" in text
+
+
+def test_signup_validation_errors(accounts_env):
+    status, _h, text = _signup(
+        b"email=test%40example.com&username=ab&password=password123")
+    assert status.startswith("400") and "3–30 characters" in text
+    status, _h, text = _signup(
+        b"email=not-an-email&username=goodname&password=password123")
+    assert status.startswith("400") and "email" in text
+    status, _h, text = _signup(
+        b"email=test%40example.com&username=goodname&password=short")
+    assert status.startswith("400") and "at least 8" in text
+
+
+def test_login_success_and_failure(accounts_env):
+    _signup()
+    # Wrong password: generic error, no hint which part failed.
+    status, text = call_app(
+        "POST", "/login", body=b"identifier=testuser&password=wrongpass1")
+    assert status.startswith("401")
+    assert "don't match our records" in text
+    # Unknown user: same message.
+    status, text = call_app(
+        "POST", "/login", body=b"identifier=nobody&password=password123")
+    assert status.startswith("401")
+    assert "don't match our records" in text
+    # Correct login by username and by email both work.
+    for ident in (b"identifier=testuser&password=password123",
+                  b"identifier=test%40example.com&password=password123"):
+        status, headers, _t = call_raw("POST", "/login", body=ident)
+        assert status.startswith("303")
+        assert _set_cookie_value(headers, "secdiff_session")
+
+
+def test_session_persistence_and_logout(accounts_env):
+    _signup()
+    _s, headers, _t = call_raw(
+        "POST", "/login", body=b"identifier=testuser&password=password123")
+    token = _set_cookie_value(headers, "secdiff_session")
+    cookie = f"secdiff_session={token}"
+    status, text = call_app("GET", "/account", cookie=cookie)
+    assert status == "200 OK"
+    assert "testuser" in text and "test@example.com" in text
+    assert "0 of 4 free companies used" in text
+    call_app("POST", "/logout", cookie=cookie)
+    status, headers, _t = call_raw("GET", "/account", cookie=cookie)
+    assert status.startswith("303")            # bounced to /login
+    assert dict(headers).get("Location") == "/login"
+
+
+def test_logged_in_report_limit_is_account_keyed(accounts_env, monkeypatch,
+                                                 tmp_path):
+    def fake_live(args):
+        return _fake_pipeline_result(args.ticker.upper())
+
+    monkeypatch.setattr(web, "live_pipeline", fake_live)
+    mapping = {t: 2000 + i for i, t in
+               enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"])}
+    # stub_resolution installs the usage store that both /report and
+    # /account read via web._STORE, so the counters line up.
+    stub_resolution(monkeypatch, tmp_path, mapping)
+    _signup()
+    _s, headers, _t = call_raw(
+        "POST", "/login", body=b"identifier=testuser&password=password123")
+    token = _set_cookie_value(headers, "secdiff_session")
+    cookie = f"secdiff_session={token}"
+    for t in ("AAA", "BBB", "CCC", "DDD"):
+        status, _text = call_app("POST", "/report",
+                                 body=f"ticker={t}".encode(), cookie=cookie)
+        assert status == "200 OK", t
+    status, _text = call_app("POST", "/report", body=b"ticker=EEE",
+                             cookie=cookie)
+    assert status.startswith("402")     # account limit is still 4
+    # /account reflects the account-keyed counter.
+    status, text = call_app("GET", "/account", cookie=cookie)
+    assert "4 of 4 free companies used" in text
+
+
+def test_change_password_flow(accounts_env):
+    _signup()
+    _s, headers, _t = call_raw(
+        "POST", "/login", body=b"identifier=testuser&password=password123")
+    token = _set_cookie_value(headers, "secdiff_session")
+    cookie = f"secdiff_session={token}"
+    status, text = call_app(
+        "POST", "/change-password", cookie=cookie,
+        body=b"current_password=nope12345&new_password=newpassword9")
+    assert status.startswith("400")
+    assert "current password doesn't match" in text
+    status, text = call_app(
+        "POST", "/change-password", cookie=cookie,
+        body=b"current_password=password123&new_password=newpassword9")
+    assert status == "200 OK"
+    assert "password has been changed" in text
+    call_app("POST", "/logout", cookie=cookie)
+    status, _t = call_app(
+        "POST", "/login", body=b"identifier=testuser&password=password123")
+    assert status.startswith("401")     # old password dead
+    _s, headers, _t = call_raw(
+        "POST", "/login", body=b"identifier=testuser&password=newpassword9")
+    assert _set_cookie_value(headers, "secdiff_session")
+
+
+def test_forgot_password_full_cycle(accounts_env):
+    store, sent, last_code = accounts_env
+    _signup()
+    status, text = call_app("POST", "/forgot-password",
+                            body=b"step=request&identifier=testuser")
+    assert status == "200 OK"
+    assert "6-digit code is on its way" in text
+    assert len(sent) == 1 and sent[0][0] == "test@example.com"
+    code = last_code()
+    # Wrong code is rejected.
+    wrong = "999999" if code != "999999" else "111111"
+    status, text = call_app(
+        "POST", "/forgot-password",
+        body=(f"step=reset&identifier=testuser&code={wrong}"
+              f"&new_password=resetpass42").encode())
+    assert status.startswith("400")
+    # Correct code resets the password.
+    status, text = call_app(
+        "POST", "/forgot-password",
+        body=(f"step=reset&identifier=testuser&code={code}"
+              f"&new_password=resetpass42").encode())
+    assert status == "200 OK"
+    assert "Password changed" in text
+    # Old password dead, new password works.
+    status, _t = call_app(
+        "POST", "/login", body=b"identifier=testuser&password=password123")
+    assert status.startswith("401")
+    _s, headers, _t = call_raw(
+        "POST", "/login", body=b"identifier=testuser&password=resetpass42")
+    assert _set_cookie_value(headers, "secdiff_session")
+    # The code is single-use: replaying it fails.
+    status, _t = call_app(
+        "POST", "/forgot-password",
+        body=(f"step=reset&identifier=testuser&code={code}"
+              f"&new_password=anotherpass1").encode())
+    assert status.startswith("400")
+
+
+def test_forgot_password_code_attempt_limit(accounts_env):
+    store, sent, last_code = accounts_env
+    _signup()
+    call_app("POST", "/forgot-password",
+             body=b"step=request&identifier=testuser")
+    code = last_code()
+    wrong = "000000" if code != "000000" else "111111"
+    for _ in range(5):
+        call_app("POST", "/forgot-password",
+                 body=(f"step=reset&identifier=testuser&code={wrong}"
+                       f"&new_password=resetpass42").encode())
+    # After 5 wrong attempts even the correct code is refused.
+    status, _t = call_app(
+        "POST", "/forgot-password",
+        body=(f"step=reset&identifier=testuser&code={code}"
+              f"&new_password=resetpass42").encode())
+    assert status.startswith("400")
+
+
+def test_forgot_password_expired_code(monkeypatch, tmp_path):
+    import secdiff.accounts as accounts_mod
+
+    store = web.AccountStore(tmp_path / "secdiff.db")
+    monkeypatch.setattr(web, "_ACCOUNTS", store)
+    sent = []
+
+    def fake_send(to, subject, body):
+        sent.append((to, subject, body))
+        return True
+
+    monkeypatch.setattr(accounts_mod, "send_email", fake_send)
+    _signup()
+    call_app("POST", "/forgot-password",
+             body=b"step=request&identifier=testuser")
+    import re as _re
+    code = _re.search(r"is: (\d{6})", sent[-1][2]).group(1)
+    user = store.get_by_username("testuser")
+    # Backdate the code's expiry.
+    with store._db() as db:
+        db.execute("UPDATE reset_codes SET expires_at = ? WHERE user_id = ?",
+                   ("2000-01-01T00:00:00+00:00", user["id"]))
+        db.commit()
+    status, _t = call_app(
+        "POST", "/forgot-password",
+        body=(f"step=reset&identifier=testuser&code={code}"
+              f"&new_password=resetpass42").encode())
+    assert status.startswith("400")
+
+
+def test_forgot_username_reveals_username(accounts_env):
+    store, sent, last_code = accounts_env
+    _signup()
+    status, text = call_app("POST", "/forgot-username",
+                            body=b"step=request&email=test%40example.com")
+    assert status == "200 OK"
+    assert len(sent) == 1
+    code = last_code()
+    status, text = call_app(
+        "POST", "/forgot-username",
+        body=f"step=verify&email=test%40example.com&code={code}".encode())
+    assert status == "200 OK"
+    assert "testuser" in text
+    # Wrong code reveals nothing.
+    call_app("POST", "/forgot-username",
+             body=b"step=request&email=test%40example.com")
+    code2 = last_code()
+    wrong = "000000" if code2 != "000000" else "111111"
+    status, text = call_app(
+        "POST", "/forgot-username",
+        body=f"step=verify&email=test%40example.com&code={wrong}".encode())
+    assert status.startswith("400")
+
+
+def test_recovery_without_mailer_is_honest(monkeypatch, tmp_path):
+    """SMTP unconfigured: the flow still responds, honestly says email
+    delivery is not switched on, and never shows a code on screen."""
+    import secdiff.accounts as accounts_mod
+
+    store = web.AccountStore(tmp_path / "secdiff.db")
+    monkeypatch.setattr(web, "_ACCOUNTS", store)
+    monkeypatch.setattr(accounts_mod, "send_email",
+                        lambda to, subject, body: False)
+    _signup()
+    status, text = call_app("POST", "/forgot-password",
+                            body=b"step=request&identifier=testuser")
+    assert status == "200 OK"
+    assert "Email delivery is not switched on" in text
+    assert "code is:" not in text
+
+
 def test_waitlist_signup_and_validation(monkeypatch, tmp_path):
     monkeypatch.setenv("SECDIFF_CACHE_DIR", str(tmp_path))
     status, text = call_app("POST", "/waitlist",
