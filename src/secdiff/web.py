@@ -28,6 +28,13 @@ Design rules, same as the rest of the project:
   is never written concurrently and EDGAR is never hit in parallel.
 - **Honest failures.** Unknown tickers and EDGAR outages produce an
   error page that says what happened. Nothing is faked or filled in.
+- **Free limit + pricing (website only; the CLI is unlimited).** Each
+  visitor (long-lived cookie) gets 4 distinct companies per UTC day
+  free; beyond that a paywall page shows the paid plans (Weekly $9,
+  Monthly $27, unlimited while active). Payments are not live yet, so
+  the paid plans take waitlist signups (name + email, stored locally)
+  instead of a fake checkout, and the limit applies to everyone until
+  real payments land.
 
 Host/port: `--host` / `--port` flags win, then the `HOST` / `PORT`
 environment variables (the convention Render/Railway/Heroku use). If
@@ -42,21 +49,28 @@ from __future__ import annotations
 import argparse
 import html
 import io
+import json
 import os
 import re
+import secrets
 import sys
 import threading
 import urllib.error
 import urllib.parse
 from contextlib import redirect_stderr
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 
 from .cli import live_pipeline, one_line_summary, render_reports
+from .edgar import EdgarClient
 
 __all__ = ["application", "main", "serve", "run_report",
-           "parse_report_form", "ReportParams", "home_page", "error_page"]
+           "parse_report_form", "ReportParams", "home_page", "error_page",
+           "paywall_page", "UsageStore", "FREE_DAILY_COMPANIES"]
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +127,131 @@ def parse_report_form(data: str) -> ReportParams:
         risk_only=first("risk_only") in ("on", "true", "1"),
         deletions_only=first("deletions_only") in ("on", "true", "1"),
         top=top)
+
+
+# ---------------------------------------------------------------------------
+# Free daily limit (website only — the CLI is never limited)
+#
+# Owner's pricing rules: each visitor may view up to FREE_DAILY_COMPANIES
+# distinct companies per calendar day (UTC) for free; re-viewing a company
+# already counted today is free. Beyond that, paid plans (Weekly $9,
+# Monthly $27) unlock unlimited reports — payments are NOT live yet (the
+# site takes waitlist signups instead), so until real payments land the
+# limit applies to everyone. Counting is by resolved company (CIK), and
+# a slot is only consumed AFTER the ticker has successfully resolved —
+# unknown tickers and other resolution errors never consume one.
+
+FREE_DAILY_COMPANIES = 4
+_VISITOR_COOKIE = "secdiff_vid"
+
+
+def _cache_dir() -> Path:
+    return Path(os.environ["SECDIFF_CACHE_DIR"]) \
+        if os.environ.get("SECDIFF_CACHE_DIR") else \
+        Path.home() / ".cache" / "secdiff"
+
+
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+class UsageStore:
+    """Per-visitor daily distinct-company counter, persisted as JSON.
+
+    File shape: {visitor_id: {"day": "YYYY-MM-DD", "ciks": [int, ...]}}.
+    A missing or corrupt file is treated as empty — counting must never
+    take the site down.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+
+    def _load(self) -> dict:
+        try:
+            data = json.loads(self.path.read_text("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save(self, data: dict) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), "utf-8")
+            os.replace(tmp, self.path)
+        except OSError:
+            pass  # counting is best-effort; never break a report over it
+
+    def companies_today(self, visitor_id: str, day: str | None = None) -> list:
+        day = day or _today_utc()
+        entry = self._load().get(visitor_id) or {}
+        return list(entry.get("ciks", [])) if entry.get("day") == day else []
+
+    def check_and_add(self, visitor_id: str, cik: int,
+                      day: str | None = None) -> bool:
+        """True if this company may be viewed now (recording it if new);
+        False when the visitor has already used all free companies today."""
+        day = day or _today_utc()
+        with self._lock:
+            data = self._load()
+            entry = data.get(visitor_id) or {}
+            ciks = list(entry.get("ciks", [])) if entry.get("day") == day else []
+            if cik in ciks:
+                return True
+            if len(ciks) >= FREE_DAILY_COMPANIES:
+                return False
+            ciks.append(cik)
+            data[visitor_id] = {"day": day, "ciks": ciks}
+            self._save(data)
+            return True
+
+
+_STORE: UsageStore | None = None
+_STORE_LOCK = threading.Lock()
+
+
+def get_usage_store() -> UsageStore:
+    global _STORE
+    with _STORE_LOCK:
+        if _STORE is None:
+            _STORE = UsageStore(_cache_dir() / "web_usage.json")
+        return _STORE
+
+
+def _resolve_company(params: ReportParams) -> tuple[int, str]:
+    """Resolve the visitor's ticker/name to (CIK, company) using the same
+    verified EDGAR resolution the CLI uses. Raises SystemExit with the
+    usual honest message when nothing matches — the caller turns that
+    into the normal error page, and no free slot is consumed."""
+    email = os.environ.get("EDGAR_EMAIL") or os.environ.get("SECDIFF_EMAIL") \
+        or "you@example.com"
+    client = EdgarClient(email=email, cache_dir=_cache_dir())
+    with redirect_stderr(io.StringIO()):   # the live run re-emits the notes
+        return client.resolve_ticker(params.ticker, form=params.form,
+                                     min_count=2)
+
+
+def _visitor_id(environ) -> tuple[str, bool]:
+    """(visitor_id, is_new) from the visitor cookie, minting one if the
+    cookie is absent or malformed."""
+    raw = environ.get("HTTP_COOKIE", "")
+    if raw:
+        jar = SimpleCookie()
+        try:
+            jar.load(raw)
+        except Exception:
+            jar = SimpleCookie()
+        morsel = jar.get(_VISITOR_COOKIE)
+        if morsel is not None and re.fullmatch(r"[0-9a-f]{32}", morsel.value):
+            return morsel.value, False
+    return secrets.token_hex(16), True
+
+
+def _cookie_header(visitor_id: str) -> tuple[str, str]:
+    return ("Set-Cookie",
+            f"{_VISITOR_COOKIE}={visitor_id}; Path=/; Max-Age=31536000; "
+            "HttpOnly; SameSite=Lax")
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +331,16 @@ button:disabled{opacity:.55;cursor:wait}
 border-top-color:#2563eb;animation:spin 0.9s linear infinite;margin:.4rem 0}
 @keyframes spin{to{transform:rotate(360deg)}}
 .note{color:#6b7280;font-size:.92rem}
+.plans{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin:1.2rem 0}
+@media (max-width:700px){.plans{grid-template-columns:1fr}}
+.plan{background:#fff;border:2px solid #e5e7eb;border-radius:10px;
+padding:1.2rem 1.3rem}
+.plan.hot{border-color:#2563eb}
+.plan h3{margin:.1rem 0 .4rem}
+.price{font-size:1.7rem;font-weight:700}
+.price span{font-size:.95rem;font-weight:400;color:#6b7280}
+.plan ul{margin:.6rem 0;padding-left:1.15rem}
+.plan .btn{margin-top:.6rem}
 .err{background:#fef2f2;border-left:4px solid #dc2626;border-radius:6px;
 padding:1rem 1.2rem;margin:1.2rem 0}
 footer{margin-top:3rem;border-top:2px solid #e5e7eb;padding-top:1rem}
@@ -284,14 +433,108 @@ on EDGAR, so any change can be checked against the original document in
 one click.</li>
 </ol>
 
+{pricing_section()}
 <footer>
 <p class="note"><strong>Not investment advice.</strong> secdiff shows
 what changed in a public document; it makes no recommendations and has
 no buy/sell outputs, price data or predictions. Data: SEC EDGAR (public
-filings). secdiff is free and open-source (MIT) — and
+filings). The secdiff tool itself is open-source (MIT); this hosted
+website is free for 4 companies a day, with paid plans above that — and
 <code>secdiff</code> is a working title.</p>
 </footer>
 <script>{_HOME_JS}</script>
+</body></html>
+"""
+
+
+def pricing_section() -> str:
+    """The pricing plans + waitlist. Shared by the home page and the
+    paywall page. Payment buttons are honest: payments are not live yet,
+    so both paid plans point at the waitlist, never a fake checkout."""
+    return """
+<h2 id="pricing">Pricing</h2>
+<div class="plans">
+  <div class="plan">
+    <h3>Free</h3>
+    <div class="price">$0</div>
+    <ul>
+      <li><strong>4 companies per day</strong></li>
+      <li>Full live reports — deletions first, words and XBRL numbers</li>
+      <li>Re-viewing a company the same day doesn't use another slot</li>
+    </ul>
+    <p class="note">No account needed. Free companies reset every day.</p>
+  </div>
+  <div class="plan">
+    <h3>Weekly</h3>
+    <div class="price">$9 <span>/ week</span></div>
+    <ul>
+      <li><strong>Unlimited companies</strong> while active</li>
+      <li>All features, 10-K and 10-Q</li>
+      <li>For a single earnings week deep-dive</li>
+    </ul>
+    <a class="btn" href="#waitlist">Payments opening soon — join the waitlist</a>
+  </div>
+  <div class="plan hot">
+    <h3>Monthly</h3>
+    <div class="price">$27 <span>/ month</span></div>
+    <ul>
+      <li><strong>Unlimited companies</strong> while active</li>
+      <li>All features, 10-K and 10-Q</li>
+      <li>Best value for following earnings season</li>
+    </ul>
+    <a class="btn" href="#waitlist">Payments opening soon — join the waitlist</a>
+  </div>
+</div>
+
+<div class="card" id="waitlist">
+  <h3 style="margin-top:0">Join the paid-plan waitlist</h3>
+  <p class="note">Payments are not open yet. Leave your name and email
+  and we'll email you when Weekly and Monthly plans go live.</p>
+  <form method="post" action="/waitlist">
+    <label for="wl-name">Name</label>
+    <input type="text" id="wl-name" name="name" required maxlength="80">
+    <label for="wl-email">Email</label>
+    <input type="text" id="wl-email" name="email" required maxlength="120"
+           placeholder="you@example.com">
+    <button type="submit">Join the waitlist</button>
+  </form>
+</div>
+"""
+
+
+def paywall_page() -> str:
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>secdiff — daily free limit reached</title><style>{_CSS}</style></head>
+<body>
+<h1>You've used today's 4 free companies</h1>
+<p class="tagline">The free plan covers <strong>4 different companies per
+day</strong>, with full reports. You've reached today's limit — companies
+you already viewed today still open, and the free four
+<strong>reset tomorrow</strong>.</p>
+<p>Want to keep going today? The paid plans give you
+<strong>unlimited companies</strong>:</p>
+{pricing_section()}
+<p><a class="btn secondary" href="/">&larr; Back to the search</a></p>
+<footer><p class="note"><strong>Not investment advice.</strong>
+Data: SEC EDGAR (public filings).</p></footer>
+</body></html>
+"""
+
+
+def waitlist_thanks_page() -> str:
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>secdiff — you're on the waitlist</title><style>{_CSS}</style></head>
+<body>
+<h1>You're on the waitlist ✅</h1>
+<p class="tagline">Thanks — we'll email you when the Weekly ($9) and
+Monthly ($27) plans open for payment.</p>
+<p><a class="btn" href="/">&larr; Back to the search</a></p>
+<footer><p class="note"><strong>Not investment advice.</strong>
+Data: SEC EDGAR (public filings).</p></footer>
 </body></html>
 """
 
@@ -318,10 +561,12 @@ Data: SEC EDGAR (public filings).</p></footer>
 # WSGI application (also the core the stdlib server dispatches to)
 
 def _respond(start_response, status: str, body,
-             content_type: str = "text/html; charset=utf-8"):
+             content_type: str = "text/html; charset=utf-8",
+             extra_headers=()):
     data = body.encode("utf-8") if isinstance(body, str) else body
     start_response(status, [("Content-Type", content_type),
-                            ("Content-Length", str(len(data)))])
+                            ("Content-Length", str(len(data))),
+                            *extra_headers])
     return [data]
 
 
@@ -329,35 +574,79 @@ def _error(start_response, status: str, title: str, message: str):
     return _respond(start_response, status, error_page(title, message))
 
 
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _join_waitlist(raw: str) -> None:
+    """Append one waitlist signup (name + email) to waitlist.jsonl in the
+    cache dir. Raises ValueError with a friendly message on bad input."""
+    qs = urllib.parse.parse_qs(raw, keep_blank_values=True)
+    name = (qs.get("name") or [""])[0].strip()
+    email = (qs.get("email") or [""])[0].strip()
+    if not name:
+        raise ValueError("Please enter your name for the waitlist.")
+    if not _EMAIL_RE.match(email):
+        raise ValueError("That email address doesn't look right — "
+                         "please check it and try again.")
+    cache = _cache_dir()
+    cache.mkdir(parents=True, exist_ok=True)
+    record = {"ts": datetime.now(timezone.utc).isoformat(),
+              "name": name, "email": email}
+    with open(cache / "waitlist.jsonl", "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
+def _read_body(environ) -> str:
+    try:
+        length = int(environ.get("CONTENT_LENGTH") or 0)
+    except ValueError:
+        length = 0
+    return environ["wsgi.input"].read(length).decode("utf-8", "replace")
+
+
 def application(environ, start_response):
-    """WSGI app: / (search form), /report (POST form or GET query),
-    /healthz. All other paths 404; all failures are honest error pages."""
+    """WSGI app: / (search form + pricing), /report (POST form or GET
+    query), /waitlist (POST), /healthz. All other paths 404; all
+    failures are honest error pages."""
     method = (environ.get("REQUEST_METHOD") or "GET").upper()
     path = environ.get("PATH_INFO") or "/"
+    visitor_id, visitor_is_new = _visitor_id(environ)
+    cookie = [_cookie_header(visitor_id)] if visitor_is_new else []
     try:
         if path in ("/", "/index.html"):
             if method not in ("GET", "HEAD"):
                 return _error(start_response, "405 Method Not Allowed",
                               "Method not allowed", "Use the search form.")
-            return _respond(start_response, "200 OK", home_page())
+            return _respond(start_response, "200 OK", home_page(),
+                            extra_headers=cookie)
         if path == "/healthz":
             return _respond(start_response, "200 OK", "ok\n",
                             "text/plain; charset=utf-8")
+        if path == "/waitlist":
+            if method != "POST":
+                return _respond(start_response, "303 See Other", "",
+                                extra_headers=[("Location", "/#waitlist")])
+            _join_waitlist(_read_body(environ))
+            return _respond(start_response, "200 OK", waitlist_thanks_page(),
+                            extra_headers=cookie)
         if path == "/report":
             if method == "POST":
-                try:
-                    length = int(environ.get("CONTENT_LENGTH") or 0)
-                except ValueError:
-                    length = 0
-                raw = environ["wsgi.input"].read(length).decode("utf-8", "replace")
+                raw = _read_body(environ)
             elif method in ("GET", "HEAD"):
                 raw = environ.get("QUERY_STRING", "")
             else:
                 return _error(start_response, "405 Method Not Allowed",
                               "Method not allowed", "Use the search form.")
             params = parse_report_form(raw)
+            # Resolve FIRST: an unknown ticker errors out here (the usual
+            # honest error page) and never consumes a free slot.
+            cik, _company = _resolve_company(params)
+            if not get_usage_store().check_and_add(visitor_id, cik):
+                return _respond(start_response, "402 Payment Required",
+                                paywall_page(), extra_headers=cookie)
             _summary, page = run_report(params)
-            return _respond(start_response, "200 OK", page)
+            return _respond(start_response, "200 OK", page,
+                            extra_headers=cookie)
         return _error(start_response, "404 Not Found", "Page not found",
                       f"There is no page at {path}.")
     except ValueError as exc:                       # bad form input
@@ -399,6 +688,7 @@ class _Handler(BaseHTTPRequestHandler):
             "PATH_INFO": parsed.path,
             "QUERY_STRING": parsed.query,
             "CONTENT_LENGTH": str(length),
+            "HTTP_COOKIE": self.headers.get("Cookie", ""),
             "wsgi.input": io.BytesIO(body),
         }
         captured: dict = {}

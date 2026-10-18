@@ -63,12 +63,13 @@ def test_parse_rejects_bad_input(body):
 
 # -- WSGI application ---------------------------------------------------------
 
-def call_app(method, path, query="", body=b""):
+def call_app(method, path, query="", body=b"", cookie=""):
     environ = {
         "REQUEST_METHOD": method,
         "PATH_INFO": path,
         "QUERY_STRING": query,
         "CONTENT_LENGTH": str(len(body)),
+        "HTTP_COOKIE": cookie,
         "wsgi.input": io.BytesIO(body),
     }
     captured = {}
@@ -80,6 +81,44 @@ def call_app(method, path, query="", body=b""):
     chunks = application(environ, start_response)
     text = b"".join(chunks).decode("utf-8")
     return captured["status"], text
+
+
+def call_app_h(method, path, query="", body=b"", cookie=""):
+    """Like call_app but also returns the response headers dict."""
+    environ = {
+        "REQUEST_METHOD": method,
+        "PATH_INFO": path,
+        "QUERY_STRING": query,
+        "CONTENT_LENGTH": str(len(body)),
+        "HTTP_COOKIE": cookie,
+        "wsgi.input": io.BytesIO(body),
+    }
+    captured = {}
+
+    def start_response(status, headers, exc_info=None):
+        captured["status"] = status
+        captured["headers"] = dict(headers)
+
+    chunks = application(environ, start_response)
+    text = b"".join(chunks).decode("utf-8")
+    return captured["status"], captured["headers"], text
+
+
+def stub_resolution(monkeypatch, tmp_path, mapping):
+    """Stub EDGAR resolution + usage store for /report tests.
+
+    mapping: ticker -> CIK int, or ticker -> exception instance to raise.
+    Returns the UsageStore in use so tests can inspect consumption."""
+    def fake_resolve(params):
+        hit = mapping[params.ticker]
+        if isinstance(hit, BaseException):   # SystemExit is a BaseException
+            raise hit
+        return hit, f"Company {params.ticker}"
+
+    store = web.UsageStore(tmp_path / "usage.json")
+    monkeypatch.setattr(web, "_resolve_company", fake_resolve)
+    monkeypatch.setattr(web, "_STORE", store)
+    return store
 
 
 def test_home_page():
@@ -134,7 +173,7 @@ def _fake_pipeline_result(ticker):
     return info, diffs, xbrl
 
 
-def test_report_route_uses_live_pipeline(monkeypatch):
+def test_report_route_uses_live_pipeline(monkeypatch, tmp_path):
     calls = []
 
     def fake_live(args):
@@ -142,6 +181,7 @@ def test_report_route_uses_live_pipeline(monkeypatch):
         return _fake_pipeline_result(args.ticker.upper())
 
     monkeypatch.setattr(web, "live_pipeline", fake_live)
+    stub_resolution(monkeypatch, tmp_path, {"EXMP": 12345})
     status, text = call_app("POST", "/report",
                             body=b"ticker=EXMP&form=10-K&risk_only=on")
     assert status == "200 OK"
@@ -151,24 +191,26 @@ def test_report_route_uses_live_pipeline(monkeypatch):
     assert "New secdiff search" in text       # web chrome added
 
 
-def test_report_unknown_ticker_shows_honest_error(monkeypatch):
-    def fake_live(args):
-        raise SystemExit("Ticker not found on EDGAR: ZZZZZ")
-
-    monkeypatch.setattr(web, "live_pipeline", fake_live)
+def test_report_unknown_ticker_shows_honest_error(monkeypatch, tmp_path):
+    store = stub_resolution(
+        monkeypatch, tmp_path,
+        {"ZZZZZ": SystemExit("Ticker not found on EDGAR: ZZZZZ")})
     status, text = call_app("POST", "/report", body=b"ticker=ZZZZZ")
     assert status.startswith("400")
     assert "Ticker not found on EDGAR: ZZZZZ" in text
     assert "No report was generated" in text
+    # A failed resolution must not consume a free slot.
+    assert store._load() == {}
 
 
-def test_report_edgar_unreachable_shows_honest_error(monkeypatch):
+def test_report_edgar_unreachable_shows_honest_error(monkeypatch, tmp_path):
     import urllib.error
 
     def fake_live(args):
         raise urllib.error.URLError("Name or service not known")
 
     monkeypatch.setattr(web, "live_pipeline", fake_live)
+    stub_resolution(monkeypatch, tmp_path, {"AAPL": 320193})
     status, text = call_app("POST", "/report", body=b"ticker=AAPL")
     assert status.startswith("502")
     assert "SEC EDGAR could not be reached" in text
@@ -184,3 +226,96 @@ def test_unknown_path_is_404():
     status, text = call_app("GET", "/nope")
     assert status.startswith("404")
     assert "Page not found" in text
+
+
+# -- free daily limit + pricing ----------------------------------------------
+
+def test_usage_store_counts_distinct_companies(tmp_path):
+    store = web.UsageStore(tmp_path / "u.json")
+    for cik in (1, 2, 3, 4):
+        assert store.check_and_add("v1", cik, day="2026-10-17") is True
+    assert store.check_and_add("v1", 5, day="2026-10-17") is False
+    # A different visitor has their own allowance.
+    assert store.check_and_add("v2", 5, day="2026-10-17") is True
+
+
+def test_usage_store_repeat_company_is_free(tmp_path):
+    store = web.UsageStore(tmp_path / "u.json")
+    for _ in range(6):
+        assert store.check_and_add("v1", 42, day="2026-10-17") is True
+    assert store.companies_today("v1", day="2026-10-17") == [42]
+
+
+def test_usage_store_day_rollover_resets(tmp_path):
+    store = web.UsageStore(tmp_path / "u.json")
+    for cik in (1, 2, 3, 4):
+        assert store.check_and_add("v1", cik, day="2026-10-17") is True
+    assert store.check_and_add("v1", 5, day="2026-10-17") is False
+    assert store.check_and_add("v1", 5, day="2026-10-18") is True
+    assert store.companies_today("v1", day="2026-10-18") == [5]
+
+
+def test_usage_store_tolerates_corrupt_file(tmp_path):
+    path = tmp_path / "u.json"
+    path.write_text("not json {{{", "utf-8")
+    store = web.UsageStore(path)
+    assert store.check_and_add("v1", 7, day="2026-10-17") is True
+    assert store.companies_today("v1", day="2026-10-17") == [7]
+
+
+def test_home_page_shows_pricing_and_waitlist():
+    status, text = call_app("GET", "/")
+    assert status == "200 OK"
+    assert "$9" in text and "$27" in text
+    assert "4 companies per day" in text
+    assert 'action="/waitlist"' in text
+    assert "Payments opening soon" in text
+
+
+def test_visitor_cookie_is_set_and_reused():
+    status, headers, _text = call_app_h("GET", "/")
+    assert status == "200 OK"
+    assert headers["Set-Cookie"].startswith("secdiff_vid=")
+    assert "HttpOnly" in headers["Set-Cookie"]
+    vid = headers["Set-Cookie"].split(";")[0].split("=", 1)[1]
+    # Presenting the cookie back must not mint a new one.
+    _s, headers2, _t = call_app_h("GET", "/", cookie=f"secdiff_vid={vid}")
+    assert "Set-Cookie" not in headers2
+
+
+def test_fifth_distinct_company_gets_paywall(monkeypatch, tmp_path):
+    def fake_live(args):
+        return _fake_pipeline_result(args.ticker.upper())
+
+    monkeypatch.setattr(web, "live_pipeline", fake_live)
+    mapping = {t: 1000 + i for i, t in
+               enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"])}
+    stub_resolution(monkeypatch, tmp_path, mapping)
+    cookie = "secdiff_vid=" + "ab" * 16
+    for t in ("AAA", "BBB", "CCC", "DDD"):
+        status, _text = call_app("POST", "/report",
+                                 body=f"ticker={t}".encode(), cookie=cookie)
+        assert status == "200 OK", t
+    # 5th distinct company -> paywall with both paid plans
+    status, text = call_app("POST", "/report", body=b"ticker=EEE",
+                            cookie=cookie)
+    assert status.startswith("402")
+    assert "$9" in text and "$27" in text
+    assert "4 free companies" in text and "reset tomorrow" in text
+    # Re-viewing an already-counted company still works at the limit.
+    status, _text = call_app("POST", "/report", body=b"ticker=AAA",
+                             cookie=cookie)
+    assert status == "200 OK"
+
+
+def test_waitlist_signup_and_validation(monkeypatch, tmp_path):
+    monkeypatch.setenv("SECDIFF_CACHE_DIR", str(tmp_path))
+    status, text = call_app("POST", "/waitlist",
+                            body=b"name=Test+User&email=test%40example.com")
+    assert status == "200 OK"
+    assert "on the waitlist" in text
+    lines = (tmp_path / "waitlist.jsonl").read_text("utf-8").strip().splitlines()
+    assert len(lines) == 1 and "test@example.com" in lines[0]
+    status, _text = call_app("POST", "/waitlist",
+                             body=b"name=X&email=not-an-email")
+    assert status.startswith("400")
