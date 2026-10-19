@@ -102,5 +102,22 @@ H  Sectors (mapping, ranking, curated-list labels)              P095–P100
     last-known "250 deletions · score 95/100" and the honest
     email-alerts note → remove → empty state.
 - Post-fix re-run: Phase 4 suite **100/100**, full suite **491/491**.
-- Go-live: commit + push (Render auto-deploys from main), then
-  lightweight live checks on https://secdiff.onrender.com.
+- Go-live: commit `4df973d` pushed to main (Render auto-deploy
+  confirmed live when `/api` went 404 → 200). Lightweight checks on
+  https://secdiff.onrender.com, values as seen:
+  - `/examples` 404, `/demo` 404, `/trending` 200 (honest all-time
+    label; production stats start empty), `/sectors` 200,
+    `/watchlist` as guest → 303 to `/login`.
+  - `/company/AAPL` 200 (Apple Inc., CIK 320193, per-form report
+    links incl. DEF 14A); `/company/ZZZZQQ` 404.
+  - `GET /api/report?ticker=AAPL` → 200 JSON: 155 del / 162 mod /
+    50 add / 75 XBRL, score 80, 10 top deletions. Missing ticker →
+    400 JSON; unknown ticker → 404 JSON.
+  - Live AAPL report carries exactly **2** "Also deleted in the
+    previous cycle" notes — the pattern feature reproduces in
+    production.
+  - Home biggest-deletes table live with real values (GOOGL 272 /
+    score 100, MSFT 237 / 70, AAPL 155 / 80, "last checked
+    2026-10-19"); the remaining majors showed the honest "still
+    being computed" note while the first background refresh worked
+    through Render's cold cache.
