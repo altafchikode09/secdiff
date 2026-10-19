@@ -94,6 +94,18 @@ live from real SEC EDGAR filings at request time — there is no demo or
 pre-generated report on the website. Unknown tickers and EDGAR outages
 produce an honest error page, never fake data.
 
+The site has one design system (`src/secdiff/theme.py`) with a light
+and a dark theme: the header toggle stores the choice in a cookie,
+and a first visit follows the OS `prefers-color-scheme` setting. The
+layout is responsive (tables scroll sideways on small screens rather
+than breaking), and a web-app manifest plus generated icons
+(`/manifest.webmanifest`, `/icon-192.png`, `/icon-512.png`) support
+"add to home screen". There is deliberately **no service worker**:
+every page is generated live and personalised (daily-limit
+accounting, account pages), so a cache could serve a stale report —
+the manifest and icons provide the install surface without that
+risk. No external fonts, CDNs or frameworks are used anywhere.
+
 Configuration is by flags or environment: `--port`/`PORT`,
 `--host`/`HOST` (binds `0.0.0.0` automatically when `PORT` is set, as
 on Render/Railway), `EDGAR_EMAIL`, and `SECDIFF_CACHE_DIR` (defaults to

@@ -202,19 +202,26 @@ def render_chart_svg(series: ChartSeries, width: int = 460,
         y0 = min(yv, axis_y)
         h = max(1.5, abs(axis_y - yv))
         color = "#dc2626" if p.value < 0 else "#2563eb"
-        out.append(f"<rect x='{x:.1f}' y='{y0:.1f}' width='{bar_w:.1f}' "
+        # The fill/stroke attributes carry the light-theme colours;
+        # the classes let the report stylesheet recolour the chart
+        # per theme (CSS wins over presentation attributes), so the
+        # chart stays legible on the dark theme too.
+        cls = "cbn" if p.value < 0 else "cb"
+        out.append(f"<rect class='{cls}' x='{x:.1f}' y='{y0:.1f}' "
+                   f"width='{bar_w:.1f}' "
                    f"height='{h:.1f}' fill='{color}' rx='2'/>")
         label = fmt_money(p.value, series.unit)
         if p.value < 0:
             ly = yv + 13
         else:
             ly = yv - 5
-        out.append(f"<text x='{cx:.1f}' y='{ly:.1f}' text-anchor='middle' "
+        out.append(f"<text class='ct' x='{cx:.1f}' y='{ly:.1f}' "
+                   f"text-anchor='middle' "
                    f"font-size='11' fill='#1a1a2e'>{e(label)}</text>")
-        out.append(f"<text x='{cx:.1f}' y='{height - 8}' "
+        out.append(f"<text class='cl' x='{cx:.1f}' y='{height - 8}' "
                    f"text-anchor='middle' font-size='11' "
                    f"fill='#6b7280'>{e(p.fy)}</text>")
-    out.append(f"<line x1='{side_pad}' y1='{axis_y:.1f}' "
+    out.append(f"<line class='ca' x1='{side_pad}' y1='{axis_y:.1f}' "
                f"x2='{width - side_pad}' y2='{axis_y:.1f}' "
                f"stroke='#9ca3af' stroke-width='1'/>")
     out.append("</svg>")

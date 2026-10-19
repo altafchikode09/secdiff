@@ -14,6 +14,7 @@ from .diffing import SectionDiff
 from .highlight import RISK_TERMS, highlight_risk
 from .score import FORMULA_TEXT, compute_score
 from .search import mark_search_term
+from .theme import REPORT_CSS
 from .xbrl import XbrlResult, fmt_money
 
 
@@ -168,35 +169,10 @@ def render_markdown(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult
     return "\n".join(out) + "\n"
 
 
-_CSS = """
-body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
-margin:2rem auto;max-width:920px;padding:0 1rem;color:#1a1a2e;line-height:1.5}
-h1{font-size:1.6rem} h2{margin-top:2.2rem;border-bottom:2px solid #e5e7eb;padding-bottom:.3rem}
-.meta{background:#f3f4f6;border-radius:8px;padding:1rem 1.2rem}
-.del{background:#fef2f2;border-left:4px solid #dc2626;padding:.6rem .9rem;margin:.5rem 0}
-.add{background:#f0fdf4;border-left:4px solid #16a34a;padding:.6rem .9rem;margin:.5rem 0}
-.mod{background:#fffbeb;border-left:4px solid #d97706;padding:.6rem .9rem;margin:.5rem 0}
-.tag{font-weight:700;font-size:.75rem;letter-spacing:.05em}
-.repeat-note{background:#f5f3ff;border-left:4px solid #8b5cf6;
-padding:.35rem .9rem;margin:-.3rem 0 .5rem;font-size:.88rem;color:#4c1d95}
-table{border-collapse:collapse;width:100%} th,td{border:1px solid #e5e7eb;
-padding:.45rem .6rem;text-align:right} th:first-child,td:first-child{text-align:left}
-.pos{color:#16a34a}.neg{color:#dc2626} a{color:#2563eb}
-.note{color:#6b7280;font-size:.9rem}
-.score{background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;
-padding:.7rem 1rem;margin-top:.8rem}
-.score .big{font-size:1.5rem;font-weight:800}
-.score .band{font-weight:700}
-.score-how{margin-top:.5rem;font-size:.9rem;color:#374151}
-.score-how summary{cursor:pointer;font-weight:600}
-mark.risk{background:#fde68a;color:inherit;padding:0 .12em;border-radius:3px}
-mark.search{background:#bfdbfe;color:inherit;padding:0 .12em;border-radius:3px;
-box-shadow:inset 0 0 0 1px #60a5fa}
-.searchbanner{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;
-padding:.7rem 1rem;margin-top:.8rem}
-.chart{margin:1.2rem 0}
-.chart h3{margin:.4rem 0}
-"""
+# The report stylesheet lives in secdiff.theme with the rest of the
+# design system (both themes, all colours via custom properties) —
+# kept under this name for the existing imports/tests.
+_CSS = REPORT_CSS
 
 
 def render_html(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult,
@@ -208,6 +184,8 @@ def render_html(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult,
     e = html.escape
     p: list[str] = []
     p.append("<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>")
+    p.append("<meta name='viewport' "
+             "content='width=device-width, initial-scale=1'>")
     p.append(f"<title>secdiff — {e(info.ticker)} {e(info.form)}</title>"
              f"<style>{_CSS}</style></head><body>")
     p.append(f"<h1>secdiff — {e(info.company)} ({e(info.ticker)}) {e(info.form)}</h1>")
@@ -261,7 +239,8 @@ def render_html(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult,
             p.append(f"<p>{e(ln)}</p>")
     p.append("<h2>XBRL numbers — what changed</h2>")
     if xbrl.rows:
-        p.append("<table><tr><th>Item</th><th>Older filing</th>"
+        p.append("<div class='tablewrap'><table><tr><th>Item</th>"
+                 "<th>Older filing</th>"
                  "<th>Newer filing</th><th>Change</th><th>%</th></tr>")
         for r in xbrl.rows:
             cls = "pos" if (r.change or 0) >= 0 else "neg"
@@ -270,7 +249,7 @@ def render_html(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult,
                      f"<td>{fmt_money(r.new, r.unit)}</td>"
                      f"<td class='{cls}'>{fmt_money(r.change, r.unit)}</td>"
                      f"<td class='{cls}'>{pct}</td></tr>")
-        p.append("</table>")
+        p.append("</table></div>")
     else:
         p.append(f"<p><em>{e(_no_xbrl_message(info.form))}</em></p>")
     if xbrl.unmapped:

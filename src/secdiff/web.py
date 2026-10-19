@@ -79,6 +79,9 @@ from .cli import _filtered_diffs, build_diffs, live_pipeline, \
     one_line_summary, render_reports
 from .edgar import EdgarClient
 from .export import xbrl_to_csv, xbrl_to_xls
+from .icons import manifest_bytes, render_icon_png
+from .theme import SITE_CSS, THEME_COOKIE, THEME_INIT_JS, clean_theme, \
+    head_block, head_links, html_tag
 from .majors import MAJORS, SECTOR_MAP, SECTOR_ORDER, MajorsStore, \
     sector_of, sort_entries
 from .patterns import annotate_repeats
@@ -96,7 +99,8 @@ __all__ = ["application", "main", "serve", "run_report",
            "WatchlistStore", "get_watchlist_store",
            "MajorsStore", "get_majors_store",
            "company_page", "trending_page",
-           "sectors_page", "watchlist_page", "api_page"]
+           "sectors_page", "watchlist_page", "api_page",
+           "THEME_COOKIE"]
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +317,82 @@ def _cookie_header(visitor_id: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Theme preference (Phase 5: light/dark)
+#
+# The visitor's explicit choice lives in a `secdiff_theme` cookie set
+# by POST /theme. It is NOT HttpOnly on purpose: the inline theme-init
+# script reads it to stamp data-theme on <html> before first paint.
+# It carries no identity and no session data — just "light"/"dark".
+# Pages rendered for a request read the choice from a request-scoped
+# context set at the top of `application`, so the many page functions
+# keep their existing signatures.
+
+_THEME_CTX = threading.local()
+
+
+def _theme_pref(environ) -> str | None:
+    """The visitor's stored theme choice for THIS request, or None
+    (no cookie / invalid value -> the CSS media query decides)."""
+    morsel = _cookies(environ).get(THEME_COOKIE)
+    return clean_theme(morsel.value) if morsel is not None else None
+
+
+def _request_theme() -> str | None:
+    return getattr(_THEME_CTX, "value", None)
+
+
+def _theme_cookie_header(value: str) -> tuple[str, str]:
+    return ("Set-Cookie",
+            f"{THEME_COOKIE}={value}; Path=/; Max-Age=31536000; "
+            "SameSite=Lax")
+
+
+def _page_open(title: str) -> str:
+    """Doctype + <html> + <head> for a site page, in the request's
+    theme. `title` is the full <title> text."""
+    theme = _request_theme()
+    return ("<!DOCTYPE html>\n" + html_tag(theme) +
+            head_block(title, theme, _CSS) + "\n<body>")
+
+
+def _theme_form(next_path: str = "") -> str:
+    """The light/dark toggle: a plain POST form (works without
+    JavaScript); the active choice is outlined. The visitor returns
+    to `next_path` when given (the report page passes its canonical
+    URL), else to the page being viewed (recorded for GET requests
+    by `application`), else to the home page."""
+    current = _request_theme()
+    on_light = " on" if current == "light" else ""
+    on_dark = " on" if current == "dark" else ""
+    if not next_path:
+        next_path = getattr(_THEME_CTX, "return_to", "") or ""
+    hidden = (f"<input type='hidden' name='next' "
+              f"value='{html.escape(next_path, quote=True)}'>"
+              if next_path else "")
+    return ("<form class='themeform' method='post' action='/theme'>"
+            f"{hidden}"
+            f"<button type='submit' name='theme' value='light' "
+            f"class='themebtn{on_light}' aria-label='Light theme'>"
+            "&#9728; Light</button>"
+            f"<button type='submit' name='theme' value='dark' "
+            f"class='themebtn{on_dark}' aria-label='Dark theme'>"
+            "&#9790; Dark</button></form>")
+
+
+def _footer(note_html: str) -> str:
+    """The shared site footer: section links + the legal note."""
+    return ("<footer class='sitefoot'>"
+            "<nav class='footnav'>"
+            "<a href='/'>Reports</a>"
+            "<a href='/trending'>Trending</a>"
+            "<a href='/sectors'>Sectors</a>"
+            "<a href='/watchlist'>Watchlist</a>"
+            "<a href='/api'>API</a>"
+            "</nav>"
+            f"<p class='note'>{note_html}</p></footer>")
+
+
+# ---------------------------------------------------------------------------
 # User accounts (signup / login / sessions / recovery)
 #
 # Accounts live in a SQLite DB (secdiff.db in the cache dir) via
@@ -370,20 +450,27 @@ def _clear_session_cookie_header() -> tuple[str, str]:
 
 
 def _header(user: dict | None) -> str:
-    """Top bar shown on every page: brand + account links."""
+    """Top bar shown on every page: brand + the shared section nav
+    (Reports, Trending, Sectors, Watchlist, API), the account links
+    and the light/dark theme toggle."""
+    sections = ("<a href='/'>Reports</a>"
+                "<a href='/trending'>Trending</a>"
+                "<a href='/sectors'>Sectors</a>"
+                "<a href='/watchlist'>Watchlist</a>"
+                "<a href='/api'>API</a>")
     if user:
-        nav = (f"<span>Hi, <strong>{html.escape(user['username'])}</strong>"
-               "</span>"
-               "<a href='/watchlist'>Watchlist</a>"
-               "<a href='/account'>My account</a>"
-               "<form method='post' action='/logout' style='display:inline'>"
-               "<button type='submit' class='linkbtn'>Log out</button>"
-               "</form>")
+        account = (
+            f"<span>Hi, <strong>{html.escape(user['username'])}</strong>"
+            "</span>"
+            "<a href='/account'>My account</a>"
+            "<form method='post' action='/logout' style='display:inline'>"
+            "<button type='submit' class='linkbtn'>Log out</button>"
+            "</form>")
     else:
-        nav = ("<a href='/login'>Log in</a>"
-               "<a class='btn' href='/signup'>Create account</a>")
+        account = ("<a href='/login'>Log in</a>"
+                   "<a class='btn' href='/signup'>Create account</a>")
     return (f"<header class='topbar'><a class='brand' href='/'>secdiff</a>"
-            f"<nav>{nav}</nav></header>")
+            f"<nav>{sections}{account}{_theme_form()}</nav></header>")
 
 
 # ---------------------------------------------------------------------------
@@ -690,25 +777,25 @@ def stats_page(user: dict, daily: list, totals: dict, top: list,
 <p class="tagline">Owner-only page. Counts only — no IP addresses and
 no raw logs are stored; a unique visitor is a visitor cookie counted
 once per day.</p>
-<table class="kv">
+<div class="tablewrap"><table class="kv">
   <tr><td>Unique visitors (all time)</td><td>{totals['visits']}</td></tr>
   <tr><td>Home pageviews (all time)</td><td>{totals['pageviews']}</td></tr>
   <tr><td>Reports run (all time)</td><td>{totals['reports']}</td></tr>
   <tr><td>Signups (all time)</td><td>{totals['signups']}</td></tr>
   <tr><td>Accounts</td><td>{accounts_count}</td></tr>
   <tr><td>Waitlist entries</td><td>{waitlist_count}</td></tr>
-</table>
+</table></div>
 <h2>Last 14 days</h2>
-<table class="data">
+<div class="tablewrap"><table class="data">
 <tr><th>Date (UTC)</th><th>Unique visitors</th><th>Pageviews</th>
 <th>Reports</th><th>Signups</th></tr>
 {day_rows}
-</table>
+</table></div>
 <h2>Top companies by reports</h2>
-<table class="data">
+<div class="tablewrap"><table class="data">
 <tr><th>Company</th><th>Reports</th></tr>
 {top_rows}
-</table>
+</table></div>
 """
     return _shell("Site stats", user, inner)
 
@@ -1034,7 +1121,7 @@ def _wrap_report(report_html: str, notes: str,
     search-in-report form."""
     account_link = ("<a href='/account'>My account</a>" if user
                     else "<a href='/login'>Log in</a>")
-    nav = ("<div style='max-width:920px;margin:1rem auto 0;padding:0 1rem'>"
+    nav = ("<div class='reporttools'>"
            "<a href='/'>&larr; New secdiff search</a>"
            f" &nbsp;·&nbsp; {account_link}")
     if canonical:
@@ -1047,6 +1134,9 @@ def _wrap_report(report_html: str, notes: str,
                 "Download numbers (CSV)</a>"
                 f" &nbsp;·&nbsp; <a href='/report.xls?{downloads}'>"
                 "Download numbers (Excel)</a>")
+    # The theme toggle lives here too, returning to this exact
+    # report (its canonical URL) after the switch.
+    nav += _theme_form(f"/report?{canonical}" if canonical else "")
     nav += "</div>"
     if canonical:
         share_url = f"/report?{canonical}"
@@ -1055,37 +1145,39 @@ def _wrap_report(report_html: str, notes: str,
             f"value='{html.escape(v, quote=True)}'>"
             for k, v in urllib.parse.parse_qsl(canonical))
         nav += (
-            "<div style='max-width:920px;margin:.6rem auto 0;"
-            "padding:.6rem 1rem;background:#f3f4f6;border-radius:6px;"
-            "font-size:.92rem'>"
+            "<div class='sharebox'>"
             "<label for='share-url' style='font-weight:600'>Share this "
             "report:</label> "
             f"<input type='text' id='share-url' readonly "
-            f"value='{html.escape(share_url, quote=True)}' "
-            "style='width:min(480px,90%);font-size:.9rem;padding:.3rem .45rem'> "
-            "<button type='button' id='copy-share' "
-            "style='margin-top:0;padding:.35rem .8rem;font-size:.9rem'>"
+            f"value='{html.escape(share_url, quote=True)}'> "
+            "<button type='button' id='copy-share'>"
             "Copy share link</button>"
-            "<form method='get' action='/report' "
-            "style='margin-top:.6rem'>"
+            "<form method='get' action='/report'>"
             f"{hidden}"
             "<label for='q' style='font-weight:600'>Search in this "
             "report:</label> "
-            f"<input type='text' id='q' name='q' maxlength='80' "
+            f"<input type='text' class='qinput' id='q' name='q' "
+            f"maxlength='80' "
             f"value='{html.escape(search_q, quote=True)}' "
-            "placeholder='e.g. lawsuit, going concern' "
-            "style='width:min(300px,80%);font-size:.9rem;"
-            "padding:.3rem .45rem'> "
-            "<button type='submit' style='margin-top:0;"
-            "padding:.35rem .8rem;font-size:.9rem'>Search</button>"
+            "placeholder='e.g. lawsuit, going concern'> "
+            "<button type='submit'>Search</button>"
             "</form></div>" + _SHARE_JS)
     if notes:
         items = "".join(f"<div>{html.escape(line)}</div>"
                         for line in notes.splitlines() if line.strip())
-        nav += (f"<div style='max-width:920px;margin:.6rem auto 0;"
-                f"padding:.6rem 1rem;background:#fffbeb;"
-                f"border-left:4px solid #d97706;border-radius:4px;"
-                f"font-size:.9rem'>{items}</div>")
+        nav += f"<div class='notesbox'>{items}</div>"
+    # The report page joins the site design system: stamp the
+    # visitor's theme on <html> and add the shared head links (theme
+    # colours, manifest, icons). Standalone report files (CLI) skip
+    # this — they carry no data-theme and follow the OS preference.
+    theme = _request_theme()
+    if theme:
+        report_html = report_html.replace(
+            "<html lang='en'>", html_tag(theme), 1)
+    extra_head = head_links(theme) + THEME_INIT_JS
+    if "</head>" in report_html:
+        report_html = report_html.replace(
+            "</head>", extra_head + "</head>", 1)
     if "<body>" in report_html:
         return report_html.replace("<body>", "<body>" + nav, 1)
     return nav + report_html
@@ -1094,59 +1186,10 @@ def _wrap_report(report_html: str, notes: str,
 # ---------------------------------------------------------------------------
 # Pages
 
-_CSS = """
-body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
-margin:0 auto;max-width:920px;padding:2rem 1rem 3rem;color:#1a1a2e;line-height:1.55}
-h1{font-size:1.9rem;margin:.2rem 0}
-h2{margin-top:2.2rem;border-bottom:2px solid #e5e7eb;padding-bottom:.3rem}
-.tagline{font-size:1.1rem;color:#374151}
-.card{background:#f3f4f6;border-radius:10px;padding:1.2rem 1.4rem;margin:1.2rem 0}
-label{display:block;font-weight:600;margin:.7rem 0 .2rem}
-label.check{font-weight:400}
-input[type=text],input[type=number],input[type=email],input[type=password],select{font-size:1rem;padding:.5rem .6rem;
-border:1px solid #d1d5db;border-radius:6px;width:100%;box-sizing:border-box}
-.topbar{display:flex;justify-content:space-between;align-items:center;
-gap:1rem;margin-bottom:1.4rem}
-.topbar .brand{font-weight:800;font-size:1.3rem;text-decoration:none;color:#1a1a2e}
-.topbar nav{display:flex;gap:.9rem;align-items:center}
-.topbar nav .btn{margin-top:0;padding:.45rem .95rem}
-.linkbtn{background:none;border:0;color:#2563eb;cursor:pointer;
-font-size:1rem;padding:0;text-decoration:underline;margin-top:0;font-weight:400}
-.ok{background:#f0fdf4;border-left:4px solid #16a34a;border-radius:6px;
-padding:1rem 1.2rem;margin:1.2rem 0}
-table.kv{border-collapse:collapse;margin:1rem 0}
-table.kv td{padding:.35rem 1.2rem .35rem 0;vertical-align:top}
-table.kv td:first-child{font-weight:600;color:#374151}
-table.data{border-collapse:collapse;margin:1rem 0}
-table.data th,table.data td{padding:.35rem 1rem .35rem 0;text-align:left}
-table.data th{border-bottom:2px solid #e5e7eb;color:#374151}
-table.data td{border-bottom:1px solid #f3f4f6}
-button,.btn{display:inline-block;background:#2563eb;color:#fff;border:0;
-font-size:1rem;font-weight:600;padding:.65rem 1.3rem;border-radius:8px;
-cursor:pointer;text-decoration:none;margin-top:1rem}
-button:disabled{opacity:.55;cursor:wait}
-.btn.secondary{background:#111827}
-.row{display:grid;grid-template-columns:1fr 160px;gap:1rem}
-@media (max-width:560px){.row{grid-template-columns:1fr}}
-.spinner{width:34px;height:34px;border-radius:50%;border:4px solid #dbeafe;
-border-top-color:#2563eb;animation:spin 0.9s linear infinite;margin:.4rem 0}
-@keyframes spin{to{transform:rotate(360deg)}}
-.note{color:#6b7280;font-size:.92rem}
-.plans{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin:1.2rem 0}
-@media (max-width:700px){.plans{grid-template-columns:1fr}}
-.plan{background:#fff;border:2px solid #e5e7eb;border-radius:10px;
-padding:1.2rem 1.3rem}
-.plan.hot{border-color:#2563eb}
-.plan h3{margin:.1rem 0 .4rem}
-.price{font-size:1.7rem;font-weight:700}
-.price span{font-size:.95rem;font-weight:400;color:#6b7280}
-.plan ul{margin:.6rem 0;padding-left:1.15rem}
-.plan .btn{margin-top:.6rem}
-.err{background:#fef2f2;border-left:4px solid #dc2626;border-radius:6px;
-padding:1rem 1.2rem;margin:1.2rem 0}
-footer{margin-top:3rem;border-top:2px solid #e5e7eb;padding-top:1rem}
-code{background:#eef2ff;padding:.1rem .35rem;border-radius:4px}
-"""
+# The site stylesheet is the Phase 5 design system (secdiff.theme):
+# one palette, light + dark themes, every colour a custom property.
+# Kept under this name — the page templates interpolate it.
+_CSS = SITE_CSS
 
 _HOME_JS = """
 document.getElementById('diff-form').addEventListener('submit', function () {
@@ -1176,10 +1219,11 @@ def _biggest_section(biggest: list | None, pending: bool,
             f"<td><a href='/report?ticker={e(en['ticker'], quote=True)}"
             f"&amp;form=10-K'>Read the report</a></td>"
             "</tr>" for en in biggest)
-        table = ("<table class='data'><tr><th>Company</th>"
+        table = ("<div class='tablewrap'><table class='data'>"
+                 "<tr><th>Company</th>"
                  "<th>Deletions</th><th>Change-intensity score</th>"
                  "<th>Latest 10-K vs the one before</th><th></th></tr>"
-                 f"{rows}</table>")
+                 f"{rows}</table></div>")
         when = (f" Counts computed from live SEC EDGAR filings; last "
                 f"checked {e(checked)} (UTC)." if checked else "")
         note = ("<p class='note'>Some companies are still being "
@@ -1202,11 +1246,7 @@ def home_page(user: dict | None = None, notice: str = "",
               biggest_checked: str = "") -> str:
     notice_html = (f"<div class='ok'><p>{html.escape(notice)}</p></div>"
                    if notice else "")
-    return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>secdiff — git diff for SEC filings</title><style>{_CSS}</style></head>
-<body>
+    return f"""{_page_open("secdiff — git diff for SEC filings")}
 {_header(user)}
 {notice_html}
 <h1>secdiff</h1>
@@ -1314,14 +1354,13 @@ PNG image.</li>
 </ol>
 
 {pricing_section()}
-<footer>
-<p class="note"><strong>Not investment advice.</strong> secdiff shows
-what changed in a public document; it makes no recommendations and has
-no buy/sell outputs, price data or predictions. Data: SEC EDGAR (public
-filings). The secdiff tool itself is open-source (MIT); this hosted
-website is free for 4 companies a day, with paid plans above that — and
-<code>secdiff</code> is a working title.</p>
-</footer>
+{_footer("<strong>Not investment advice.</strong> secdiff shows "
+         "what changed in a public document; it makes no recommendations "
+         "and has no buy/sell outputs, price data or predictions. "
+         "Data: SEC EDGAR (public filings). The secdiff tool itself is "
+         "open-source (MIT); this hosted website is free for 4 companies "
+         "a day, with paid plans above that — and <code>secdiff</code> "
+         "is a working title.")}
 <script>{_HOME_JS}</script>
 </body></html>
 """
@@ -1383,11 +1422,7 @@ def pricing_section() -> str:
 
 
 def paywall_page(user: dict | None = None) -> str:
-    return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>secdiff — daily free limit reached</title><style>{_CSS}</style></head>
-<body>
+    return f"""{_page_open("secdiff — daily free limit reached")}
 {_header(user)}
 <h1>You've used today's 4 free companies</h1>
 <p class="tagline">The free plan covers <strong>4 different companies per
@@ -1398,35 +1433,27 @@ you already viewed today still open, and the free four
 <strong>unlimited companies</strong>:</p>
 {pricing_section()}
 <p><a class="btn secondary" href="/">&larr; Back to the search</a></p>
-<footer><p class="note"><strong>Not investment advice.</strong>
-Data: SEC EDGAR (public filings).</p></footer>
+{_footer("<strong>Not investment advice.</strong> "
+         "Data: SEC EDGAR (public filings).")}
 </body></html>
 """
 
 
 def waitlist_thanks_page(user: dict | None = None) -> str:
-    return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>secdiff — you're on the waitlist</title><style>{_CSS}</style></head>
-<body>
+    return f"""{_page_open("secdiff — you're on the waitlist")}
 {_header(user)}
 <h1>You're on the waitlist ✅</h1>
 <p class="tagline">Thanks — we'll email you when the Weekly ($9) and
 Monthly ($27) plans open for payment.</p>
 <p><a class="btn" href="/">&larr; Back to the search</a></p>
-<footer><p class="note"><strong>Not investment advice.</strong>
-Data: SEC EDGAR (public filings).</p></footer>
+{_footer("<strong>Not investment advice.</strong> "
+         "Data: SEC EDGAR (public filings).")}
 </body></html>
 """
 
 
 def error_page(title: str, message: str, user: dict | None = None) -> str:
-    return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>secdiff — {html.escape(title)}</title><style>{_CSS}</style></head>
-<body>
+    return f"""{_page_open(f"secdiff — {title}")}
 {_header(user)}
 <h1>{html.escape(title)}</h1>
 <div class="err"><p>{html.escape(message)}</p></div>
@@ -1434,8 +1461,8 @@ def error_page(title: str, message: str, user: dict | None = None) -> str:
 guessed — when EDGAR doesn't give us the filings, we show you this page
 instead of a made-up result.</p>
 <p><a class="btn" href="/">&larr; Back to the search</a></p>
-<footer><p class="note"><strong>Not investment advice.</strong>
-Data: SEC EDGAR (public filings).</p></footer>
+{_footer("<strong>Not investment advice.</strong> "
+         "Data: SEC EDGAR (public filings).")}
 </body></html>
 """
 
@@ -1444,15 +1471,11 @@ Data: SEC EDGAR (public filings).</p></footer>
 # Account pages
 
 def _shell(title: str, user: dict | None, inner: str) -> str:
-    return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>secdiff — {html.escape(title)}</title><style>{_CSS}</style></head>
-<body>
+    return f"""{_page_open(f"secdiff — {title}")}
 {_header(user)}
 {inner}
-<footer><p class="note"><strong>Not investment advice.</strong>
-Data: SEC EDGAR (public filings).</p></footer>
+{_footer("<strong>Not investment advice.</strong> "
+         "Data: SEC EDGAR (public filings).")}
 </body></html>
 """
 
@@ -1531,12 +1554,12 @@ def account_page(user: dict, used_today: int, message: str = "",
     inner = f"""
 <h1>My account</h1>
 {ok}{_form_error(error)}
-<table class="kv">
+<div class="tablewrap"><table class="kv">
   <tr><td>Username</td><td>{html.escape(user['username'])}</td></tr>
   <tr><td>Email</td><td>{html.escape(user['email'])}</td></tr>
   <tr><td>Plan</td><td>{html.escape(plan)}</td></tr>
   <tr><td>Today</td><td>{used_today} of {FREE_DAILY_COMPANIES} free companies used</td></tr>
-</table>
+</table></div>
 <p class="note">Paid plans (Weekly $9, Monthly $27 — unlimited companies)
 are <strong>opening soon</strong>; until payments go live, every account
 gets the same 4 free companies a day as guests.</p>
@@ -1719,16 +1742,16 @@ def company_page(user: dict | None, data: dict) -> str:
 <h1>{e(data['company'])}</h1>
 <p class="tagline">Ticker <strong>{e(data['ticker'])}</strong> ·
 SEC EDGAR CIK {data['cik']}</p>
-<table class="kv">
+<div class="tablewrap"><table class="kv">
   <tr><td>Company</td><td>{e(data['company'])}</td></tr>
   <tr><td>CIK</td><td>{data['cik']}</td></tr>
   {extra}
-</table>
+</table></div>
 <h2>Filings on EDGAR</h2>
-<table class="data">
+<div class="tablewrap"><table class="data">
 <tr><th>Form</th><th>Filings</th><th>Filing years</th><th></th></tr>
 {''.join(form_rows)}
-</table>
+</table></div>
 <p class="note">Filing counts and years are this company's own SEC
 EDGAR submission history. Running a report counts toward your daily
 free companies, like any report on this site.</p>
@@ -1783,9 +1806,10 @@ def trending_page(user: dict | None, top: list) -> str:
             f"<td><a href='/report?ticker={e(t, quote=True)}"
             f"&amp;form=10-K'>Latest 10-K report</a></td>"
             "</tr>" for t, n in top)
-        body = ("<table class='data'><tr><th>Company</th>"
+        body = ("<div class='tablewrap'><table class='data'>"
+                "<tr><th>Company</th>"
                 "<th>Reports run</th><th></th></tr>"
-                f"{rows}</table>")
+                f"{rows}</table></div>")
     else:
         body = ("<p>No reports have been run on this site yet — "
                 "this list fills in as visitors generate reports.</p>")
@@ -1829,10 +1853,11 @@ def sectors_page(user: dict | None, groups: list,
             "</tr>" for en in entries)
         parts.append(
             f"<h2>{e(sector)}</h2>"
-            "<table class='data'><tr><th>Company</th><th>Deletions "
+            "<div class='tablewrap'><table class='data'>"
+            "<tr><th>Company</th><th>Deletions "
             "(latest 10-K)</th><th>Change-intensity score</th>"
             "<th>Filings</th><th></th></tr>"
-            f"{rows}</table>")
+            f"{rows}</table></div>")
     if not parts:
         parts.append("<p>No sector summaries have been computed yet "
                      "— check back in a moment.</p>")
@@ -1919,9 +1944,10 @@ def watchlist_page(user: dict, entries: list, majors: dict,
             "</form></td>"
             "</tr>")
     if rows:
-        table = ("<table class='data'><tr><th>Ticker</th><th>Company"
+        table = ("<div class='tablewrap'><table class='data'>"
+                 "<tr><th>Ticker</th><th>Company"
                  "</th><th>Last-known latest-10-K</th><th></th>"
-                 "<th></th></tr>" + "".join(rows) + "</table>")
+                 "<th></th></tr>" + "".join(rows) + "</table></div>")
     else:
         table = ("<p>Your watchlist is empty — add a company below "
                  "and it will stay here, on your account, on every "
@@ -2030,7 +2056,7 @@ behind it.</p>
 
 <h2>Endpoint</h2>
 <p><code>GET /api/report?ticker={ticker}&amp;form={form}</code></p>
-<table class="data">
+<div class="tablewrap"><table class="data">
 <tr><th>Parameter</th><th>Required</th><th>Notes</th></tr>
 <tr><td><code>ticker</code></td><td>yes</td><td>A ticker symbol
 (including class-share spellings with a dot) or the company's
@@ -2039,7 +2065,7 @@ name — resolved against EDGAR exactly like the website.</td></tr>
 8-K or DEF 14A.</td></tr>
 <tr><td><code>vs_year</code> / <code>base_year</code></td><td>no</td>
 <td>Compare those filing years instead of the latest two.</td></tr>
-</table>
+</table></div>
 
 <h2>Response</h2>
 <p>A JSON object with: <code>company</code>, <code>ticker</code>,
@@ -2241,6 +2267,29 @@ def _read_body(environ) -> str:
     return environ["wsgi.input"].read(length).decode("utf-8", "replace")
 
 
+def _theme_route(environ, start_response, method, user, cookie):
+    """POST /theme — store the visitor's light/dark choice in the
+    theme cookie and send them back where they were. Presentation
+    only: no account, limit or content state is touched. The `next`
+    field is honoured only for local paths (never `//host` or
+    absolute URLs), so the toggle can't become an open redirect."""
+    if method != "POST":
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the theme buttons.",
+                      user)
+    fields = _form_fields(environ)
+    value = clean_theme(fields.get("theme", ""))
+    if value is None:
+        return _error(start_response, "400 Bad Request",
+                      "Unknown theme",
+                      "The theme must be “light” or “dark”.", user)
+    target = fields.get("next", "")
+    if not target.startswith("/") or target.startswith("//"):
+        target = "/"
+    return _redirect(start_response, target,
+                     [_theme_cookie_header(value), *cookie])
+
+
 def application(environ, start_response):
     """WSGI app: / (search form + pricing), /report (POST form or GET
     query, with ?q= for search-in-report), the report downloads
@@ -2249,12 +2298,25 @@ def application(environ, start_response):
     /waitlist (POST), the account pages (/signup, /login, /logout,
     /account, /change-password, /forgot-password, /forgot-username),
     the owner-only /stats (404 for everyone but the STATS_USERNAME
-    account), /healthz. All other paths 404; all failures are honest
-    error pages."""
+    account), /healthz, and the Phase 5 presentation routes:
+    /theme (POST, sets the light/dark cookie), /manifest.webmanifest
+    and the generated icons (/icon-192.png, /icon-512.png,
+    /apple-touch-icon.png). All other paths 404; all failures are
+    honest error pages."""
     method = (environ.get("REQUEST_METHOD") or "GET").upper()
     path = environ.get("PATH_INFO") or "/"
     visitor_id, visitor_is_new = _visitor_id(environ)
     cookie = [_cookie_header(visitor_id)] if visitor_is_new else []
+    # The request's theme choice, read by every page renderer via
+    # _request_theme(). Set unconditionally so a pooled thread never
+    # leaks the previous request's theme. `return_to` (GET requests
+    # only) is where the theme toggle sends the visitor back to.
+    _THEME_CTX.value = _theme_pref(environ)
+    if method in ("GET", "HEAD"):
+        qs = environ.get("QUERY_STRING", "")
+        _THEME_CTX.return_to = path + (f"?{qs}" if qs else "")
+    else:
+        _THEME_CTX.return_to = ""
     try:
         user = _current_user(environ)
     except Exception:                       # accounts must never break the site
@@ -2291,6 +2353,29 @@ def application(environ, start_response):
         if path == "/healthz":
             return _respond(start_response, "200 OK", "ok\n",
                             "text/plain; charset=utf-8")
+        if path == "/manifest.webmanifest":
+            if method not in ("GET", "HEAD"):
+                return _error(start_response, "405 Method Not Allowed",
+                              "Method not allowed", "Use the browser.",
+                              user)
+            return _respond(start_response, "200 OK", manifest_bytes(),
+                            "application/manifest+json",
+                            extra_headers=[("Cache-Control",
+                                            "public, max-age=86400")])
+        if path in ("/icon-192.png", "/icon-512.png",
+                    "/apple-touch-icon.png"):
+            if method not in ("GET", "HEAD"):
+                return _error(start_response, "405 Method Not Allowed",
+                              "Method not allowed", "Use the browser.",
+                              user)
+            size = 512 if path == "/icon-512.png" else 192
+            return _respond(start_response, "200 OK",
+                            render_icon_png(size), "image/png",
+                            extra_headers=[("Cache-Control",
+                                            "public, max-age=604800")])
+        if path == "/theme":
+            return _theme_route(environ, start_response, method, user,
+                                cookie)
         if path == "/waitlist":
             if method != "POST":
                 return _redirect(start_response, "/#waitlist")
