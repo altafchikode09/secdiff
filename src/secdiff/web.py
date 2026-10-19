@@ -75,18 +75,28 @@ from types import SimpleNamespace
 from . import accounts as _accounts
 from .accounts import AccountStore
 from .card import build_card_data, render_card_png
-from .cli import _filtered_diffs, live_pipeline, one_line_summary, \
-    render_reports
+from .cli import _filtered_diffs, build_diffs, live_pipeline, \
+    one_line_summary, render_reports
 from .edgar import EdgarClient
 from .export import xbrl_to_csv, xbrl_to_xls
+from .majors import MAJORS, SECTOR_MAP, SECTOR_ORDER, MajorsStore, \
+    sector_of, sort_entries
+from .patterns import annotate_repeats
 from .pdf import render_pdf
+from .report import _counts
+from .score import compute_score
 from .search import clean_search_term
+from .watchlist import WatchlistStore
 
 __all__ = ["application", "main", "serve", "run_report",
            "parse_report_form", "ReportParams", "home_page", "error_page",
            "paywall_page", "UsageStore", "FREE_DAILY_COMPANIES",
            "AccountStore", "get_account_store",
-           "StatsStore", "get_stats_store", "stats_page"]
+           "StatsStore", "get_stats_store", "stats_page",
+           "WatchlistStore", "get_watchlist_store",
+           "MajorsStore", "get_majors_store",
+           "company_page", "trending_page",
+           "sectors_page", "watchlist_page", "api_page"]
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +257,10 @@ class UsageStore:
 
 
 _STORE: UsageStore | None = None
-_STORE_LOCK = threading.Lock()
+_STORE_LOCK = threading.RLock()   # RLock: getters may nest (watchlist
+                                  # store creation needs the account
+                                  # store) — a plain Lock deadlocked
+                                  # the first cold watchlist call
 
 
 def get_usage_store() -> UsageStore:
@@ -258,14 +271,20 @@ def get_usage_store() -> UsageStore:
         return _STORE
 
 
+def _edgar_client() -> EdgarClient:
+    """The site's EDGAR client (declared User-Agent, shared on-disk
+    cache, SEC pacing) — one construction for every route."""
+    email = os.environ.get("EDGAR_EMAIL") or os.environ.get("SECDIFF_EMAIL") \
+        or "you@example.com"
+    return EdgarClient(email=email, cache_dir=_cache_dir())
+
+
 def _resolve_company(params: ReportParams) -> tuple[int, str]:
     """Resolve the visitor's ticker/name to (CIK, company) using the same
     verified EDGAR resolution the CLI uses. Raises SystemExit with the
     usual honest message when nothing matches — the caller turns that
     into the normal error page, and no free slot is consumed."""
-    email = os.environ.get("EDGAR_EMAIL") or os.environ.get("SECDIFF_EMAIL") \
-        or "you@example.com"
-    client = EdgarClient(email=email, cache_dir=_cache_dir())
+    client = _edgar_client()
     with redirect_stderr(io.StringIO()):   # the live run re-emits the notes
         return client.resolve_ticker(params.ticker, form=params.form,
                                      min_count=2)
@@ -355,6 +374,7 @@ def _header(user: dict | None) -> str:
     if user:
         nav = (f"<span>Hi, <strong>{html.escape(user['username'])}</strong>"
                "</span>"
+               "<a href='/watchlist'>Watchlist</a>"
                "<a href='/account'>My account</a>"
                "<form method='post' action='/logout' style='display:inline'>"
                "<button type='submit' class='linkbtn'>Log out</button>"
@@ -494,6 +514,15 @@ class StatsStore:
                 "ORDER BY n DESC, key ASC LIMIT ?", (limit,)).fetchall()
         return [(r["key"], r["n"]) for r in rows]
 
+    def report_count(self, ticker: str) -> int:
+        """Reports generated for one ticker on this site (all time)."""
+        with self._db() as db:
+            row = db.execute(
+                "SELECT COALESCE(SUM(count), 0) AS n FROM stats_events "
+                "WHERE kind = 'report' AND key = ?",
+                (ticker,)).fetchone()
+        return int(row["n"]) if row else 0
+
     def total_accounts(self) -> int:
         """Number of registered accounts (users table, same DB)."""
         try:
@@ -530,6 +559,106 @@ def _record(kind: str, key: str = "",
             store.record(kind, key)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Major-filer summaries (home "Biggest deletes" + /sectors) and watchlists
+#
+# A major's summary (latest 10-K deletion counts + score) costs one real
+# pipeline run, so results are cached per UTC day in a JSON store and a
+# page NEVER blocks on computing one: it renders what is cached, marks
+# the rest "computing", and a single background thread refreshes the
+# stale/missing entries. A failed refresh changes nothing — the entry
+# simply stays absent or stale, and the page says so.
+
+_MAJORS: MajorsStore | None = None
+_WATCHLIST: WatchlistStore | None = None
+_REFRESH_LOCK = threading.Lock()
+_refreshing = False
+# Background refreshes are started only by the real server (serve()
+# flips this on). A bare WSGI import — tests, other servers — renders
+# the cached values and the honest "computing" state instead of
+# spawning threads behind the caller's back.
+_AUTO_REFRESH_MAJORS = False
+
+
+def get_majors_store() -> MajorsStore:
+    global _MAJORS
+    with _STORE_LOCK:
+        if _MAJORS is None:
+            _MAJORS = MajorsStore(_cache_dir() / "biggest_deletes.json")
+        return _MAJORS
+
+
+def get_watchlist_store() -> WatchlistStore:
+    global _WATCHLIST
+    if _WATCHLIST is None:
+        # Resolve the account store BEFORE taking the lock: it takes
+        # the same lock, and nesting the two used to deadlock the
+        # first cold call (found in Phase 4 live testing).
+        db_path = get_account_store().path      # same DB file, on purpose
+        with _STORE_LOCK:
+            if _WATCHLIST is None:
+                _WATCHLIST = WatchlistStore(db_path)
+    return _WATCHLIST
+
+
+def _major_summary(ticker: str) -> dict:
+    """Compute one major filer's latest-10-K summary through the same
+    pipeline the reports use. Raises whatever the pipeline raises —
+    the refresh worker treats any failure as "leave the cache alone".
+    """
+    info, diffs, xbrl = _compute_data(ReportParams(ticker=ticker,
+                                                   form="10-K"))
+    d, m, a = _counts(diffs)
+    sc = compute_score(diffs, xbrl)
+    return {"ticker": info.ticker, "company": info.company,
+            "cik": info.cik, "deletions": d, "modifications": m,
+            "additions": a, "score": sc.total, "band": sc.band,
+            "new_date": info.new_date, "old_date": info.old_date,
+            "checked": _today_utc()}
+
+
+def _refresh_majors_worker(tickers: list,
+                           store: MajorsStore | None = None) -> None:
+    """Background refresh of stale/missing major summaries, written
+    into the store captured when the refresh was kicked off. Strictly
+    best-effort: any failure (EDGAR down, unknown ticker) leaves the
+    cached entry untouched."""
+    global _refreshing
+    store = store or get_majors_store()
+    try:
+        for ticker in tickers:
+            try:
+                store.put(_major_summary(ticker))
+            except Exception:
+                pass
+    finally:
+        with _REFRESH_LOCK:
+            _refreshing = False
+
+
+def _maybe_refresh_majors(extra_tickers=()) -> dict:
+    """Return the cached major summaries, kicking off ONE background
+    refresh for entries that are missing or stale (checked before
+    today, UTC). `extra_tickers` widens the refresh set (the /sectors
+    universe) beyond the MAJORS list."""
+    global _refreshing
+    store = get_majors_store()
+    entries = store.load()
+    want = list(MAJORS)
+    for t in extra_tickers:
+        if t not in want:
+            want.append(t)
+    stale = [t for t in want if not store.is_fresh(entries.get(t))]
+    if stale and _AUTO_REFRESH_MAJORS:
+        with _REFRESH_LOCK:
+            if not _refreshing:
+                _refreshing = True
+                threading.Thread(target=_refresh_majors_worker,
+                                 args=(stale, store),
+                                 daemon=True).start()
+    return entries
 
 
 def _waitlist_count() -> int:
@@ -628,7 +757,7 @@ def _download(start_response, environ, method: str,
             _usage_key(user, visitor_id), cik):
         return _respond(start_response, "402 Payment Required",
                         paywall_page(user), extra_headers=cookie)
-    summary, _page, xbrl = _compute_report(params, user)
+    summary, _page, xbrl = _compute_report(params, user, annotate=False)
     _record("report", _report_key(summary, params))
     stem = (f"secdiff-{params.ticker}-{params.form}"
             .lower().replace(" ", "-").replace("/", "-"))
@@ -775,8 +904,52 @@ def _canonical_query(info, params: ReportParams) -> str:
     return urllib.parse.urlencode(q)
 
 
+def _annotate_patterns(params: ReportParams, info, diffs) -> None:
+    """Mark deletion hunks that repeat a deletion from the
+    immediately-earlier filing pair ("Also deleted in the previous
+    cycle", see secdiff.patterns).
+
+    The earlier pair is the one ending at THIS report's older filing:
+    (older, the filing before it). Best-effort by design — any failure
+    (fewer than 3 filings, EDGAR hiccup) simply leaves the report
+    unannotated; a missing note must never break or falsify a report.
+    The link pins the earlier pair's filing years; when both were
+    filed in the same year a year pair cannot name the pair, so the
+    note is shown without a link rather than with a wrong one.
+    """
+    try:
+        # A real live run always resolves the ticker through EDGAR
+        # first, which caches this CIK's submissions file in the
+        # shared cache. If it is not there, this report did not come
+        # from the live pipeline (a stubbed/offline context) and there
+        # is no earlier pair to consult — stay silent, and offline.
+        subs_cache = _cache_dir() / f"submissions_{info.cik:010d}.json"
+        if not subs_cache.exists():
+            return
+        client = _edgar_client()
+        filings = client.all_filings(info.cik, params.form)
+        idx = next((i for i, f in enumerate(filings)
+                    if f.accession == info.old_accession), None)
+        if idx is None or idx + 1 >= len(filings):
+            return
+        newer_prev, older_prev = filings[idx], filings[idx + 1]
+        earlier_diffs, _conf = build_diffs(
+            client.filing_text(info.cik, older_prev),
+            client.filing_text(info.cik, newer_prev), params.form)
+        url = ""
+        if newer_prev.filing_date[:4] != older_prev.filing_date[:4]:
+            q = {"ticker": info.ticker, "form": params.form,
+                 "vs_year": newer_prev.filing_date[:4],
+                 "base_year": older_prev.filing_date[:4]}
+            url = f"/report?{urllib.parse.urlencode(q)}"
+        annotate_repeats(diffs, earlier_diffs, url)
+    except Exception:
+        pass
+
+
 def _compute_report(params: ReportParams,
-                    user: dict | None = None):
+                    user: dict | None = None,
+                    annotate: bool = True):
     """Run the shared pipeline once.
 
     Returns (one_line_summary, full_html_page, xbrl_result). Pipeline
@@ -789,6 +962,10 @@ def _compute_report(params: ReportParams,
     notes = io.StringIO()
     with _RUN_LOCK, redirect_stderr(notes):
         info, diffs, xbrl = live_pipeline(args)
+        if annotate:
+            # Annotate the RAW hunks: the renderer's filters share the
+            # same Hunk objects, so notes survive filtering.
+            _annotate_patterns(params, info, diffs)
         canonical = _canonical_query(info, params)
         if params.q:
             # The banner's "show the full report" link: this exact
@@ -980,7 +1157,49 @@ document.getElementById('diff-form').addEventListener('submit', function () {
 """
 
 
-def home_page(user: dict | None = None, notice: str = "") -> str:
+def _biggest_section(biggest: list | None, pending: bool,
+                       checked: str) -> str:
+    """The home page's "Biggest deletes" section: cached latest-10-K
+    deletion counts for the major filers (see secdiff.majors). Only
+    computed entries are listed — a company whose count has not been
+    computed yet is never given a placeholder number; the section says
+    it is still computing instead."""
+    e = html.escape
+    if biggest:
+        rows = "".join(
+            "<tr>"
+            f"<td><a href='/company/{e(en['ticker'], quote=True)}'>"
+            f"{e(en['ticker'])}</a> — {e(en['company'])}</td>"
+            f"<td><strong>{en['deletions']}</strong></td>"
+            f"<td>{en['score']}/100 ({e(en['band'])})</td>"
+            f"<td>{e(en['new_date'])} vs {e(en['old_date'])}</td>"
+            f"<td><a href='/report?ticker={e(en['ticker'], quote=True)}"
+            f"&amp;form=10-K'>Read the report</a></td>"
+            "</tr>" for en in biggest)
+        table = ("<table class='data'><tr><th>Company</th>"
+                 "<th>Deletions</th><th>Change-intensity score</th>"
+                 "<th>Latest 10-K vs the one before</th><th></th></tr>"
+                 f"{rows}</table>")
+        when = (f" Counts computed from live SEC EDGAR filings; last "
+                f"checked {e(checked)} (UTC)." if checked else "")
+        note = ("<p class='note'>Some companies are still being "
+                "computed — refresh in a moment for the full table."
+                "</p>" if pending else "")
+        return (f"<h2>Biggest deletes — major filers</h2>{table}"
+                f"<p class='note'>Deletions in each company's latest "
+                f"10-K versus the one before it, biggest first.{when} "
+                f"See also <a href='/sectors'>sectors</a>.</p>{note}")
+    return ("<h2>Biggest deletes — major filers</h2>"
+            "<p class='note'>Computing the latest 10-K deletion counts "
+            "for the major filers (AAPL, MSFT, GOOGL, TSLA, XOM, AMZN, "
+            "NVDA, META) from live SEC EDGAR filings — refresh in a "
+            "moment. Nothing is shown here until it has really been "
+            "computed.</p>")
+
+
+def home_page(user: dict | None = None, notice: str = "",
+              biggest: list | None = None, biggest_pending: bool = False,
+              biggest_checked: str = "") -> str:
     notice_html = (f"<div class='ok'><p>{html.escape(notice)}</p></div>"
                    if notice else "")
     return f"""<!DOCTYPE html>
@@ -1029,12 +1248,11 @@ what a company <em>stops saying</em> is often the story.</p>
              max="2100" placeholder="previous">
     </div>
   </div>
-  <p class="note">Pick two years to compare those exact filings — for
-  example the 2025 10-K against the 2022 one. If a year you pick has no
-  filing of that form, the result page says so and lists the years that
-  do exist. Proxies (DEF 14A) are diffed in words only — they carry no
-  XBRL numbers table. 8-Ks are event filings, so the two compared usually
-  cover different events.</p>
+  <p class="note">Pick two years to compare those exact filings. If a
+  year you pick has no filing of that form, the result page says so
+  and lists the years that do exist. Proxies (DEF 14A) are diffed in
+  words only — they carry no XBRL numbers table. 8-Ks are event
+  filings, so the two compared usually cover different events.</p>
   <label class="check"><input type="checkbox" name="risk_only">
     Risk factors only (Item 1A)</label>
   <label class="check"><input type="checkbox" name="deletions_only">
@@ -1057,6 +1275,12 @@ what a company <em>stops saying</em> is often the story.</p>
 <p class="note">Every report on this site is generated live from real
 SEC EDGAR filings at the moment you ask — there are no sample or
 pre-generated reports here.</p>
+
+<p class="note">Explore: <a href="/trending">trending on secdiff</a> ·
+<a href="/sectors">sectors</a> · <a href="/api">API</a> ·
+<a href="/watchlist">your watchlist</a></p>
+
+{_biggest_section(biggest, biggest_pending, biggest_checked)}
 
 <h2>How it works</h2>
 <ol>
@@ -1456,6 +1680,475 @@ def username_revealed_page(username: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Phase 4 pages: company pages, trending, sectors, watchlist, API docs
+# + JSON API. Every number on these pages comes from the same EDGAR
+# pipeline or from the site's own stores (stats / majors cache /
+# watchlist) — nothing is invented, and every page labels its source.
+# There is deliberately no demo or examples page anywhere on the site
+# (owner's standing rule); /examples and /demo are plain 404s.
+
+def company_page(user: dict | None, data: dict) -> str:
+    e = html.escape
+    form_rows = []
+    for fr in data["forms"]:
+        if fr["can_diff"]:
+            action = (f"<a href='/report?ticker="
+                      f"{e(data['ticker'], quote=True)}&amp;form="
+                      f"{e(fr['form'], quote=True)}'>Run the "
+                      f"{e(fr['form'])} report</a>")
+        else:
+            action = ("<span class='note'>Only one filing on EDGAR — "
+                      "a diff needs two.</span>")
+        years = ", ".join(str(y) for y in fr["years"])
+        if len(fr["years"]) > 15:
+            years += ", …"
+        form_rows.append(
+            f"<tr><td>{e(fr['form'])}</td><td>{fr['count']}</td>"
+            f"<td>{e(years) if years else '—'}</td><td>{action}</td></tr>")
+    extra = ""
+    if data["report_count"]:
+        extra += (f"<tr><td>Reports run on this site</td>"
+                  f"<td>{data['report_count']}</td></tr>")
+    major = data.get("major")
+    if major:
+        extra += (f"<tr><td>Latest 10-K (this site, checked "
+                  f"{e(major['checked'])})</td><td>{major['deletions']} "
+                  f"deletions · change-intensity score {major['score']}"
+                  f"/100</td></tr>")
+    inner = f"""
+<h1>{e(data['company'])}</h1>
+<p class="tagline">Ticker <strong>{e(data['ticker'])}</strong> ·
+SEC EDGAR CIK {data['cik']}</p>
+<table class="kv">
+  <tr><td>Company</td><td>{e(data['company'])}</td></tr>
+  <tr><td>CIK</td><td>{data['cik']}</td></tr>
+  {extra}
+</table>
+<h2>Filings on EDGAR</h2>
+<table class="data">
+<tr><th>Form</th><th>Filings</th><th>Filing years</th><th></th></tr>
+{''.join(form_rows)}
+</table>
+<p class="note">Filing counts and years are this company's own SEC
+EDGAR submission history. Running a report counts toward your daily
+free companies, like any report on this site.</p>
+"""
+    return _shell(data["company"], user, inner)
+
+
+def _company_route(start_response, method, user, raw_segment: str):
+    if method not in ("GET", "HEAD"):
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the browser.", user)
+    segment = urllib.parse.unquote(raw_segment).strip()
+    ticker_q = " ".join(segment.upper().split())
+    if not ticker_q or "/" in segment or not _QUERY_RE.match(ticker_q):
+        return _error(start_response, "404 Not Found", "Page not found",
+                      "There is no company page at that address.", user)
+    client = _edgar_client()
+    try:
+        with redirect_stderr(io.StringIO()):
+            cik, company = client.resolve_ticker(ticker_q, form="10-K",
+                                                 min_count=1)
+    except SystemExit as exc:
+        msg = str(exc.code) if exc.code else "Company not found."
+        return _error(start_response, "404 Not Found",
+                      "Company not found", msg, user)
+    forms = []
+    for form in _FORMS:
+        filings = client.all_filings(cik, form)
+        years = sorted({f.filing_year for f in filings
+                        if f.filing_year is not None}, reverse=True)
+        forms.append({"form": form, "count": len(filings),
+                      "years": years, "can_diff": len(filings) >= 2})
+    label = client.name_matched_ticker or ticker_q
+    try:
+        report_count = get_stats_store().report_count(label)
+    except Exception:
+        report_count = 0
+    major = get_majors_store().get(label)
+    data = {"ticker": label, "company": company, "cik": cik,
+            "forms": forms, "report_count": report_count,
+            "major": major}
+    return _respond(start_response, "200 OK", company_page(user, data))
+
+
+def trending_page(user: dict | None, top: list) -> str:
+    e = html.escape
+    if top:
+        rows = "".join(
+            "<tr>"
+            f"<td><a href='/company/{e(t, quote=True)}'>{e(t)}</a></td>"
+            f"<td>{n}</td>"
+            f"<td><a href='/report?ticker={e(t, quote=True)}"
+            f"&amp;form=10-K'>Latest 10-K report</a></td>"
+            "</tr>" for t, n in top)
+        body = ("<table class='data'><tr><th>Company</th>"
+                "<th>Reports run</th><th></th></tr>"
+                f"{rows}</table>")
+    else:
+        body = ("<p>No reports have been run on this site yet — "
+                "this list fills in as visitors generate reports.</p>")
+    inner = f"""
+<h1>Trending on secdiff</h1>
+<p class="tagline">The companies with the most reports generated
+<strong>on this site</strong> — all time. These are this site's own
+usage counts (they include testing), not market data and not a
+ranking of the companies themselves.</p>
+{body}
+"""
+    return _shell("Trending on secdiff", user, inner)
+
+
+def _trending_route(start_response, method, user):
+    if method not in ("GET", "HEAD"):
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the browser.", user)
+    return _respond(start_response, "200 OK",
+                    trending_page(user, get_stats_store()
+                                  .top_companies(25)))
+
+
+def sectors_page(user: dict | None, groups: list,
+                 pending: list) -> str:
+    """groups: [(sector, [entry, ...]), ...] in display order;
+    pending: tickers in the universe whose summary is not computed
+    yet (named honestly, never given numbers)."""
+    e = html.escape
+    parts = []
+    for sector, entries in groups:
+        rows = "".join(
+            "<tr>"
+            f"<td><a href='/company/{e(en['ticker'], quote=True)}'>"
+            f"{e(en['ticker'])}</a> — {e(en['company'])}</td>"
+            f"<td><strong>{en['deletions']}</strong></td>"
+            f"<td>{en['score']}/100 ({e(en['band'])})</td>"
+            f"<td>{e(en['new_date'])} vs {e(en['old_date'])}</td>"
+            f"<td><a href='/report?ticker={e(en['ticker'], quote=True)}"
+            f"&amp;form=10-K'>Read the report</a></td>"
+            "</tr>" for en in entries)
+        parts.append(
+            f"<h2>{e(sector)}</h2>"
+            "<table class='data'><tr><th>Company</th><th>Deletions "
+            "(latest 10-K)</th><th>Change-intensity score</th>"
+            "<th>Filings</th><th></th></tr>"
+            f"{rows}</table>")
+    if not parts:
+        parts.append("<p>No sector summaries have been computed yet "
+                     "— check back in a moment.</p>")
+    pending_note = ""
+    if pending:
+        pending_note = ("<p class='note'>Still computing: "
+                        + ", ".join(e(t) for t in pending)
+                        + " — refresh in a moment; no numbers are "
+                        "shown for a company until its report has "
+                        "really been computed.</p>")
+    inner = f"""
+<h1>Sectors</h1>
+<p class="tagline">Well-known companies grouped by sector, ranked by
+the deletions in their latest 10-K. This is a <strong>curated list of
+well-known companies only — not full-market coverage</strong>: the
+universe is the major filers plus mapped companies visitors have run
+reports on.</p>
+{''.join(parts)}
+{pending_note}
+"""
+    return _shell("Sectors", user, inner)
+
+
+def _sectors_route(start_response, method, user):
+    if method not in ("GET", "HEAD"):
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the browser.", user)
+    trending = [t for t, _n in get_stats_store().top_companies(25)]
+    universe = list(MAJORS)
+    for t in trending:
+        if t in SECTOR_MAP and t not in universe:
+            universe.append(t)
+    entries_map = _maybe_refresh_majors(
+        [t for t in universe if t in SECTOR_MAP])
+    by_sector: dict[str, list] = {}
+    pending = []
+    for t in universe:
+        sector = sector_of(t)
+        if sector is None:
+            continue
+        entry = entries_map.get(t)
+        if not isinstance(entry, dict):
+            entry = None
+        if entry is None:
+            pending.append(t)
+        else:
+            by_sector.setdefault(sector, []).append(entry)
+    order = {name: i for i, name in enumerate(SECTOR_ORDER)}
+    groups = [(sector, sort_entries(entries))
+              for sector, entries in sorted(
+                  by_sector.items(),
+                  key=lambda kv: (order.get(kv[0], len(order)), kv[0]))]
+    return _respond(start_response, "200 OK",
+                    sectors_page(user, groups, pending))
+
+
+def watchlist_page(user: dict, entries: list, majors: dict,
+                   message: str = "", error: str = "") -> str:
+    e = html.escape
+    ok = (f"<div class='ok'><p>{e(message)}</p></div>" if message else "")
+    rows = []
+    for en in entries:
+        major = majors.get(en["ticker"].upper()) \
+            if isinstance(majors, dict) else None
+        if major:
+            known = (f"{major['deletions']} deletions · score "
+                     f"{major['score']}/100 (checked "
+                     f"{e(major['checked'])})")
+        else:
+            known = ("<span class='note'>not computed yet</span>")
+        rows.append(
+            "<tr>"
+            f"<td><a href='/company/"
+            f"{e(en['ticker'], quote=True)}'>{e(en['ticker'])}</a></td>"
+            f"<td>{e(en['company'])}</td>"
+            f"<td>{known}</td>"
+            f"<td><a href='/report?ticker="
+            f"{e(en['ticker'], quote=True)}&amp;form=10-K'>"
+            f"Latest 10-K report</a></td>"
+            "<td><form method='post' action='/watchlist/remove' "
+            "style='display:inline'>"
+            f"<input type='hidden' name='cik' value='{en['cik']}'>"
+            "<button type='submit' class='linkbtn'>Remove</button>"
+            "</form></td>"
+            "</tr>")
+    if rows:
+        table = ("<table class='data'><tr><th>Ticker</th><th>Company"
+                 "</th><th>Last-known latest-10-K</th><th></th>"
+                 "<th></th></tr>" + "".join(rows) + "</table>")
+    else:
+        table = ("<p>Your watchlist is empty — add a company below "
+                 "and it will stay here, on your account, on every "
+                 "device.</p>")
+    inner = f"""
+<h1>Your watchlist</h1>
+{ok}{_form_error(error)}
+{table}
+<div class="card">
+  <h3 style="margin-top:0">Add a company</h3>
+  <form method="post" action="/watchlist/add">
+    <label for="wl-ticker">Ticker or company name</label>
+    <input type="text" id="wl-ticker" name="ticker" required
+           maxlength="40" placeholder="AAPL or Microsoft"
+           autocomplete="off">
+    <button type="submit">Add to watchlist</button>
+  </form>
+</div>
+<p class="note"><strong>Email alerts are not switched on yet.</strong>
+When email delivery is enabled for this site, your watchlist companies
+will be the ones you are alerted about when a new filing lands.
+Nothing is emailed today — the list above is saved on your account
+only.</p>
+"""
+    return _shell("Your watchlist", user, inner)
+
+
+def _watchlist_view(environ, start_response, method, user):
+    if user is None:
+        return _redirect(start_response, "/login")
+    if method not in ("GET", "HEAD"):
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the form.", user)
+    qs = urllib.parse.parse_qs(environ.get("QUERY_STRING", ""))
+    message = (qs.get("msg") or [""])[0]
+    error = (qs.get("err") or [""])[0]
+    entries = get_watchlist_store().list(user["id"])
+    return _respond(start_response, "200 OK",
+                    watchlist_page(user, entries,
+                                   get_majors_store().load(),
+                                   message, error))
+
+
+def _watchlist_redirect(start_response, msg: str = "", err: str = ""):
+    q = {}
+    if msg:
+        q["msg"] = msg
+    if err:
+        q["err"] = err
+    suffix = f"?{urllib.parse.urlencode(q)}" if q else ""
+    return _redirect(start_response, f"/watchlist{suffix}")
+
+
+def _watchlist_add(environ, start_response, method, user):
+    if user is None:
+        return _redirect(start_response, "/login")
+    if method != "POST":
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the form.", user)
+    f = _form_fields(environ)
+    try:
+        params = parse_report_form(
+            urllib.parse.urlencode({"ticker": f.get("ticker", "")}))
+    except ValueError as exc:
+        return _watchlist_redirect(start_response, err=str(exc))
+    try:
+        cik, company = _resolve_company(params)
+    except SystemExit as exc:
+        msg = str(exc.code) if exc.code else "Company not found."
+        return _watchlist_redirect(start_response, err=msg)
+    added = get_watchlist_store().add(user["id"], cik, params.ticker,
+                                      company)
+    if added:
+        return _watchlist_redirect(
+            start_response,
+            msg=f"{params.ticker} ({company}) added to your watchlist.")
+    return _watchlist_redirect(
+        start_response,
+        msg=f"{company} is already on your watchlist.")
+
+
+def _watchlist_remove(environ, start_response, method, user):
+    if user is None:
+        return _redirect(start_response, "/login")
+    if method != "POST":
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the form.", user)
+    f = _form_fields(environ)
+    try:
+        cik = int(f.get("cik", ""))
+    except ValueError:
+        return _watchlist_redirect(start_response,
+                                   err="That removal didn't parse.")
+    get_watchlist_store().remove(user["id"], cik)
+    return _watchlist_redirect(start_response,
+                               msg="Removed from your watchlist.")
+
+
+def api_page(user: dict | None = None) -> str:
+    inner = """
+<h1>API</h1>
+<p class="tagline">A small read-only JSON API over the same live
+pipeline the website uses. Every response is computed from real SEC
+EDGAR filings at request time — there is no cached or sample data
+behind it.</p>
+
+<h2>Endpoint</h2>
+<p><code>GET /api/report?ticker={ticker}&amp;form={form}</code></p>
+<table class="data">
+<tr><th>Parameter</th><th>Required</th><th>Notes</th></tr>
+<tr><td><code>ticker</code></td><td>yes</td><td>A ticker symbol
+(including class-share spellings with a dot) or the company's
+name — resolved against EDGAR exactly like the website.</td></tr>
+<tr><td><code>form</code></td><td>no</td><td>10-K (default), 10-Q,
+8-K or DEF 14A.</td></tr>
+<tr><td><code>vs_year</code> / <code>base_year</code></td><td>no</td>
+<td>Compare those filing years instead of the latest two.</td></tr>
+</table>
+
+<h2>Response</h2>
+<p>A JSON object with: <code>company</code>, <code>ticker</code>,
+<code>cik</code>, <code>form</code>, <code>filings</code>
+(<code>newer</code> / <code>older</code>, each with accession, date
+and EDGAR URLs), <code>counts</code> (deletions, modifications,
+additions, xbrl_changed), <code>score</code> (the change-intensity
+score: total, band and the published breakdown), <code>top_deletions</code>
+(the report's biggest deleted sentences, biggest first) and
+<code>report_url</code> (the same report as a web page).</p>
+
+<h2>Limits — read this before building on it</h2>
+<ul>
+<li><strong>No API key, no signup</strong> — for now.</li>
+<li>The API shares the website's free limit: <strong>4 distinct
+companies per day</strong> per visitor (per account when logged in),
+counted by company, across the API and the website together.
+Re-running a company you already viewed today is free.</li>
+<li>Beyond the limit the API answers <code>402</code> with a JSON
+error. Paid plans (Weekly $9, Monthly $27) will raise this when
+payments open.</li>
+<li>Errors are JSON too: <code>400</code> for invalid input,
+<code>404</code> when the company cannot be found on EDGAR,
+<code>502</code> when EDGAR itself cannot be reached.</li>
+<li>Not investment advice; data is SEC EDGAR public filings.</li>
+</ul>
+"""
+    return _shell("API", user, inner)
+
+
+def _api_docs_route(start_response, method, user):
+    if method not in ("GET", "HEAD"):
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the browser.", user)
+    return _respond(start_response, "200 OK", api_page(user))
+
+
+def _api_report_route(start_response, environ, method, user,
+                      visitor_id, cookie):
+    """GET /api/report — the JSON report. Same accounting as /report:
+    parse (400 JSON) → resolve (404 JSON, no slot) → daily limit by
+    CIK (402 JSON) → compute through the shared pipeline."""
+    def jerr(status: str, message: str):
+        return _respond(start_response, status,
+                        json.dumps({"error": message}),
+                        "application/json; charset=utf-8",
+                        extra_headers=cookie)
+
+    if method not in ("GET", "HEAD"):
+        return jerr("405 Method Not Allowed",
+                    "Use GET for the API.")
+    try:
+        params = parse_report_form(environ.get("QUERY_STRING", ""))
+    except ValueError as exc:
+        return jerr("400 Bad Request", str(exc))
+    try:
+        cik, _company = _resolve_company(params)
+    except SystemExit as exc:
+        msg = str(exc.code) if exc.code else "Company not found."
+        return jerr("404 Not Found", msg)
+    if not get_usage_store().check_and_add(
+            _usage_key(user, visitor_id), cik):
+        return jerr("402 Payment Required",
+                    "Daily free limit reached: 4 distinct companies "
+                    "per day across the website and the API. The "
+                    "limit resets tomorrow (UTC).")
+    try:
+        info, diffs, xbrl = _compute_data(params)
+    except SystemExit as exc:
+        msg = str(exc.code) if exc.code else "No report could be built."
+        return jerr("400 Bad Request", msg)
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        return jerr("502 Bad Gateway",
+                    f"SEC EDGAR could not be reached ({reason}).")
+    _record("report", info.ticker)
+    d, m, a = _counts(diffs)
+    sc = compute_score(diffs, xbrl)
+    deletions = sorted(
+        (h for s in diffs for h in s.hunks if h.kind == "deletion"),
+        key=lambda h: -h.size)
+    payload = {
+        "company": info.company,
+        "ticker": info.ticker,
+        "cik": info.cik,
+        "form": info.form,
+        "filings": {
+            "newer": {"accession": info.new_accession,
+                      "date": info.new_date,
+                      "url": info.new_url,
+                      "index_url": info.new_index_url},
+            "older": {"accession": info.old_accession,
+                      "date": info.old_date,
+                      "url": info.old_url,
+                      "index_url": info.old_index_url},
+        },
+        "counts": {"deletions": d, "modifications": m,
+                   "additions": a, "xbrl_changed": len(xbrl.rows)},
+        "score": {"total": sc.total, "band": sc.band,
+                  "breakdown": sc.breakdown()},
+        "top_deletions": [h.old for h in deletions[:10]],
+        "report_url": f"/report?{_canonical_query(info, params)}",
+    }
+    return _respond(start_response, "200 OK", json.dumps(payload),
+                    "application/json; charset=utf-8",
+                    extra_headers=cookie)
+
+
+# ---------------------------------------------------------------------------
 # WSGI application (also the core the stdlib server dispatches to)
 
 def _respond(start_response, status: str, body,
@@ -1580,8 +2273,21 @@ def application(environ, start_response):
                           "this account on any device.")
             _record("pageview")
             _record("visit", visitor_id=visitor_id)
+            # Biggest deletes: render the cached major summaries and
+            # let a background thread refresh anything stale — the
+            # home page never waits on EDGAR.
+            _maybe_refresh_majors()
+            majors_store = get_majors_store()
+            cached = [majors_store.get(t) for t in MAJORS]
+            biggest = sort_entries([en for en in cached if en])
+            biggest_pending = any(
+                not MajorsStore.is_fresh(en) for en in cached) \
+                or len(biggest) < len(MAJORS)
+            biggest_checked = biggest[0]["checked"] if biggest else ""
             return _respond(start_response, "200 OK",
-                            home_page(user, notice), extra_headers=cookie)
+                            home_page(user, notice, biggest,
+                                      biggest_pending, biggest_checked),
+                            extra_headers=cookie)
         if path == "/healthz":
             return _respond(start_response, "200 OK", "ok\n",
                             "text/plain; charset=utf-8")
@@ -1622,6 +2328,25 @@ def application(environ, start_response):
             return _forgot_username(environ, start_response, method)
         if path == "/stats":
             return _stats(start_response, method, user)
+        if path == "/trending":
+            return _trending_route(start_response, method, user)
+        if path == "/sectors":
+            return _sectors_route(start_response, method, user)
+        if path == "/watchlist":
+            return _watchlist_view(environ, start_response, method, user)
+        if path == "/watchlist/add":
+            return _watchlist_add(environ, start_response, method, user)
+        if path == "/watchlist/remove":
+            return _watchlist_remove(environ, start_response, method,
+                                     user)
+        if path == "/api":
+            return _api_docs_route(start_response, method, user)
+        if path == "/api/report":
+            return _api_report_route(start_response, environ, method,
+                                     user, visitor_id, cookie)
+        if path.startswith("/company/"):
+            return _company_route(start_response, method, user,
+                                  path[len("/company/"):])
         if path in ("/report.csv", "/report.xls"):
             return _download(start_response, environ, method, user,
                              visitor_id, cookie,
@@ -1882,6 +2607,8 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def serve(host: str, port: int) -> None:
+    global _AUTO_REFRESH_MAJORS
+    _AUTO_REFRESH_MAJORS = True   # the real server refreshes the majors
     server = ThreadingHTTPServer((host, port), _Handler)
     print(f"secdiff web: http://{host}:{port}  (Ctrl+C to stop)", flush=True)
     try:

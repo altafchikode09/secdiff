@@ -34,6 +34,8 @@ class Hunk:
     old: str = ""        # old sentence ("" for additions)
     new: str = ""        # new sentence ("" for deletions)
     size: int = 0        # ranking score: characters changed
+    note: str = ""       # optional annotation set AFTER the diff is
+    note_url: str = ""   # computed (see secdiff.patterns); "" = no note
 
 
 @dataclass
