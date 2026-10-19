@@ -133,6 +133,33 @@ secdiff MSFT --form 10-Q --section mdna --top 10 # biggest MD&A changes last qua
 secdiff TSLA --years 2 --summarize               # two-year diff, summarised
 ```
 
+## Reading the report — score, highlights, trends
+
+Every report (HTML + Markdown, CLI and web) opens with three reading
+aids, all computed deterministically from the same diff — no AI:
+
+- **Change-intensity score (0–100).** A transparent measure of how
+  much language disappeared or was rewritten where readers look
+  first: `min(40, 5 × deletions in Risk Factors / Legal sections) +
+  min(30, total deletions) + min(20, 5 × tracked XBRL numbers the
+  newer filing no longer reports) + min(10, 2 × modifications in
+  Risk Factors / Legal sections)`. The report prints every raw count
+  and the formula next to the score, so it can be recomputed by hand.
+  It measures *how much changed* — it is **not** investment advice and
+  **not** a judgement about the company.
+- **Risk-word highlights.** A fixed, published list of risk terms
+  (lawsuit, litigation, investigation, going concern, default,
+  bankruptcy, restatement, material weakness, covenant, subpoena,
+  fraud, indictment, penalty) is highlighted in the changed text of
+  the HTML report, with the list printed as a legend. Matching is
+  word-boundary and case-insensitive, and never fires inside a URL.
+- **Multi-year trend charts.** For Revenue, Net income, Total assets
+  and Long-term debt, the HTML report charts the last 3–5 **annual**
+  values from EDGAR's company-concept API: one tag and one unit per
+  chart, fiscal years labelled, the most recently filed value winning
+  each year (labelled "as most recently reported"). A concept with
+  fewer than 2 comparable annual points simply gets no chart.
+
 ## How the diff works (and why you can trust it)
 
 1. **Retrieval** — a small built-in EDGAR client (ticker → CIK →

@@ -12,6 +12,7 @@ Only public EDGAR endpoints are used:
 - https://data.sec.gov/submissions/CIK##########.json (filing history)
 - https://www.sec.gov/Archives/edgar/data/...          (filing documents)
 - https://data.sec.gov/api/xbrl/companyfacts/...       (XBRL facts)
+- https://data.sec.gov/api/xbrl/companyconcept/...     (one concept's history)
 
 Ticker resolution is deliberately paranoid: EDGAR's ticker files can point
 a ticker at a related entity that never files the form you asked for (e.g.
@@ -355,6 +356,16 @@ class EdgarClient:
     def company_facts(self, cik: int) -> dict:
         return self._fetch_json(f"{BASE_DATA}/api/xbrl/companyfacts/CIK{cik:010d}.json",
                                 f"companyfacts_{cik:010d}.json")
+
+    def company_concept(self, cik: int, taxonomy: str, tag: str) -> dict:
+        """All values a company ever reported for ONE XBRL concept
+        (EDGAR company-concept API), through the same paced cache.
+        Raises urllib HTTPError (e.g. 404) when the company never
+        reported that tag — callers treat that as "no data"."""
+        return self._fetch_json(
+            f"{BASE_DATA}/api/xbrl/companyconcept/CIK{cik:010d}/"
+            f"{taxonomy}/{tag}.json",
+            f"concept_{cik:010d}_{taxonomy}_{tag}.json")
 
 
 _TAG_RE = re.compile(r"<[^>]+>")

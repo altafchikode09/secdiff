@@ -36,6 +36,7 @@ import os
 import sys
 from pathlib import Path
 
+from .charts import build_charts
 from .diffing import diff_section
 from .edgar import EdgarClient, Filing
 from .export import xbrl_to_csv
@@ -203,6 +204,12 @@ def live_pipeline(args):
     diffs, conf = build_diffs(old_text, new_text, args.form)
     facts = client.company_facts(cik)
     xbrl = compute_delta(facts, older.accession, newer.accession)
+    if args.form in ("10-K", "10-Q"):
+        # Multi-year annual trend charts for the headline numbers.
+        # build_charts never raises and returns [] when a concept has
+        # fewer than 2 comparable annual points; 8-K / proxy reports
+        # carry no financial trend charts (their reports say why).
+        xbrl.charts = build_charts(client, cik)
     info = FilingInfo(
         # When the user typed a company name, label the report with the
         # ticker it matched; otherwise with what they typed, as before.

@@ -67,6 +67,9 @@ class XbrlResult:
     unmapped: list[str]   # human-readable "Concept (only in newer/older filing)"
     matched: int = 0      # concepts reported by BOTH filings (== len(rows))
     considered: int = 0   # concepts in the tracked catalogue
+    disappeared: int = 0  # tracked concepts the OLDER filing reported only
+    appeared: int = 0     # tracked concepts the NEWER filing reported only
+    charts: list = field(default_factory=list)  # list[charts.ChartSeries]
 
 
 def _span_days(e: dict) -> int | None:
@@ -209,6 +212,8 @@ def compute_delta(facts: dict, old_accession: str, new_accession: str) -> XbrlRe
     analysis = analyse_concepts(facts, old_accession, new_accession)
     rows: list[DeltaRow] = []
     unmapped: list[str] = []
+    disappeared = 0
+    appeared = 0
     for r in analysis:
         if r["status"] == "matched":
             old_v, new_v = r["old"], r["new"]
@@ -218,6 +223,10 @@ def compute_delta(facts: dict, old_accession: str, new_accession: str) -> XbrlRe
                                  old_v, new_v, change, pct, r["category"]))
         elif r["status"] == "one-sided":
             side_word = "newer" if r["side"].startswith("newer") else "older"
+            if side_word == "newer":
+                appeared += 1
+            else:
+                disappeared += 1
             unmapped.append(
                 f"{r['label']} ({r['alias']}) — reported in {side_word} filing only; "
                 "likely retagged or newly disclosed, NOT merged into the delta table")
@@ -226,7 +235,8 @@ def compute_delta(facts: dict, old_accession: str, new_accession: str) -> XbrlRe
                 f"{r['label']} — reported by both filings but not safely matchable "
                 f"({r['reason']}); NOT guessed")
     return XbrlResult(rows=rows, unmapped=unmapped,
-                      matched=len(rows), considered=len(analysis))
+                      matched=len(rows), considered=len(analysis),
+                      disappeared=disappeared, appeared=appeared)
 
 
 def fmt_money(v: float | None, unit: str = "USD") -> str:

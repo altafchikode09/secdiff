@@ -9,7 +9,10 @@ from __future__ import annotations
 import html
 from dataclasses import dataclass
 
+from .charts import render_chart_svg
 from .diffing import SectionDiff
+from .highlight import RISK_TERMS, highlight_risk
+from .score import FORMULA_TEXT, compute_score
 from .xbrl import XbrlResult, fmt_money
 
 
@@ -78,6 +81,10 @@ def render_markdown(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult
                f"[document]({info.old_url})")
     out.append(f"- **Changes found:** {d} deletions · {m} modifications · "
                f"{a} additions · {len(xbrl.rows)} XBRL numbers changed")
+    score = compute_score(diffs, xbrl)
+    out.append(f"- **Change-intensity score: {score.total}/100 "
+               f"({score.band})** — {score.breakdown()}. "
+               f"{FORMULA_TEXT}")
     if xbrl.considered:
         out.append(f"- **XBRL coverage:** {xbrl.matched} of {xbrl.considered} "
                    "tracked concepts were reported by both filings")
@@ -109,6 +116,24 @@ def render_markdown(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult
         out.append("**Retagged / unmapped concepts (listed, never merged):**")
         for u in xbrl.unmapped:
             out.append(f"- {u}")
+    if xbrl.charts:
+        out.append("")
+        out.append("## Multi-year trends — annual values")
+        out.append("")
+        out.append("One tag and one unit per concept; the most recently "
+                   "filed value wins each fiscal year (values as most "
+                   "recently reported). Source: SEC EDGAR "
+                   "company-concept API.")
+        for s in xbrl.charts:
+            out.append("")
+            out.append(f"### {s.label} ({s.unit}) — tag `{s.alias}`")
+            out.append("")
+            out.append("| Fiscal year | Value |")
+            out.append("|---|---|")
+            for pt in s.points:
+                out.append(f"| {pt.fy} | {fmt_money(pt.value, s.unit)} |")
+            out.append("")
+            out.append(f"Source: {s.source_url}")
     out.append("")
     out.append("## Text changes — deletions first")
     for s in diffs:
@@ -151,6 +176,15 @@ table{border-collapse:collapse;width:100%} th,td{border:1px solid #e5e7eb;
 padding:.45rem .6rem;text-align:right} th:first-child,td:first-child{text-align:left}
 .pos{color:#16a34a}.neg{color:#dc2626} a{color:#2563eb}
 .note{color:#6b7280;font-size:.9rem}
+.score{background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;
+padding:.7rem 1rem;margin-top:.8rem}
+.score .big{font-size:1.5rem;font-weight:800}
+.score .band{font-weight:700}
+.score-how{margin-top:.5rem;font-size:.9rem;color:#374151}
+.score-how summary{cursor:pointer;font-weight:600}
+mark.risk{background:#fde68a;color:inherit;padding:0 .12em;border-radius:3px}
+.chart{margin:1.2rem 0}
+.chart h3{margin:.4rem 0}
 """
 
 
@@ -173,6 +207,15 @@ def render_html(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult,
              f"<a href='{e(info.old_url)}'>document</a></div>")
     p.append(f"<div><strong>{d} deletions · {m} modifications · {a} additions · "
              f"{len(xbrl.rows)} XBRL numbers changed</strong></div>")
+    score = compute_score(diffs, xbrl)
+    p.append("<div class='score'>")
+    p.append(f"<span class='big'>{score.total}/100</span> "
+             f"<span class='band'>Change-intensity score: "
+             f"{e(score.band)}</span>")
+    p.append(f"<div>{e(score.breakdown())}</div>")
+    p.append(f"<details class='score-how'><summary>How is this score "
+             f"calculated?</summary>{e(FORMULA_TEXT)}</details>")
+    p.append("</div>")
     if xbrl.considered:
         p.append(f"<div class='note'>XBRL coverage: {xbrl.matched} of "
                  f"{xbrl.considered} tracked concepts were reported by both "
@@ -207,25 +250,58 @@ def render_html(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult,
         for u in xbrl.unmapped:
             p.append(f"<li>{e(u)}</li>")
         p.append("</ul>")
-    p.append("<h2>Text changes — deletions first</h2>")
+    if xbrl.charts:
+        p.append("<h2>Multi-year trends — annual values</h2>")
+        p.append("<p class='note'>One tag and one unit per concept; the "
+                 "most recently filed value wins each fiscal year "
+                 "(values as most recently reported). Source: SEC EDGAR "
+                 "company-concept API.</p>")
+        for s in xbrl.charts:
+            p.append("<div class='chart'>")
+            p.append(f"<h3>{e(s.label)} ({e(s.unit)})</h3>")
+            p.append(render_chart_svg(s))
+            p.append(f"<p class='note'>Tag: {e(s.alias)} · "
+                     f"<a href='{e(s.source_url)}'>EDGAR source</a></p>")
+            p.append("</div>")
+    # Highlight risk terms in the change text first (on the escaped
+    # text, never inside URLs), count them, and only then print the
+    # legend — the legend lists exactly the published terms.
+    rendered: list[tuple[SectionDiff, list[tuple[str, str, str]]]] = []
+    risk_hits = 0
     for s in diffs:
         if not s.hunks:
             continue
+        hunks_html: list[tuple[str, str, str]] = []
+        for h in s.hunks:
+            old_html, n1 = highlight_risk(e(h.old)) if h.old else ("", 0)
+            new_html, n2 = highlight_risk(e(h.new)) if h.new else ("", 0)
+            risk_hits += n1 + n2
+            hunks_html.append((h.kind, old_html, new_html))
+        rendered.append((s, hunks_html))
+    p.append("<h2>Text changes — deletions first</h2>")
+    if risk_hits:
+        p.append(f"<p class='note'><mark class='risk'>Highlighted</mark> "
+                 f"words are the published risk terms ({risk_hits} "
+                 f"highlight{'s' if risk_hits != 1 else ''} in this "
+                 f"report): {e(', '.join(RISK_TERMS))}. Highlighting "
+                 f"is a reading aid only — a highlighted word is not, "
+                 f"by itself, a finding about the company.</p>")
+    for s, hunks_html in rendered:
         if s.item == "FULL":    # whole-document fallback section
             p.append(f"<h3>{e(s.title)}</h3>")
         else:
             p.append(f"<h3>Item {e(s.item)} — {e(s.title)}</h3>")
         p.append(f"<p class='note'>Source: <a href='{e(info.old_url)}'>older filing</a>"
                  f" vs <a href='{e(info.new_url)}'>newer filing</a></p>")
-        for h in s.hunks:
-            if h.kind == "deletion":
-                p.append(f"<div class='del'><span class='tag'>DELETED</span><br>{e(h.old)}</div>")
-            elif h.kind == "modification":
+        for kind, old_html, new_html in hunks_html:
+            if kind == "deletion":
+                p.append(f"<div class='del'><span class='tag'>DELETED</span><br>{old_html}</div>")
+            elif kind == "modification":
                 p.append(f"<div class='mod'><span class='tag'>CHANGED</span><br>"
-                         f"<strong>was:</strong> {e(h.old)}<br>"
-                         f"<strong>now:</strong> {e(h.new)}</div>")
+                         f"<strong>was:</strong> {old_html}<br>"
+                         f"<strong>now:</strong> {new_html}</div>")
             else:
-                p.append(f"<div class='add'><span class='tag'>ADDED</span><br>{e(h.new)}</div>")
+                p.append(f"<div class='add'><span class='tag'>ADDED</span><br>{new_html}</div>")
     p.append("<hr><p class='note'>Generated by secdiff. Data: SEC EDGAR. "
              "Not investment advice.</p></body></html>")
     return "\n".join(p)
