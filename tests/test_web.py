@@ -51,7 +51,7 @@ def test_parse_company_name_is_accepted():
 @pytest.mark.parametrize("body", [
     "",                     # missing ticker
     "ticker=",              # blank ticker
-    "ticker=AAPL&form=8-K",  # unsupported form
+    "ticker=AAPL&form=S-1",  # unsupported form
     "ticker=AAPL&top=abc",  # non-numeric top
     "ticker=AAPL&top=0",    # out-of-range top
     "ticker=AAPL&top=9999",  # out-of-range top

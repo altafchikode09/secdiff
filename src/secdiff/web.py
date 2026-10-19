@@ -76,6 +76,7 @@ from . import accounts as _accounts
 from .accounts import AccountStore
 from .cli import live_pipeline, one_line_summary, render_reports
 from .edgar import EdgarClient
+from .export import xbrl_to_csv, xbrl_to_xls
 
 __all__ = ["application", "main", "serve", "run_report",
            "parse_report_form", "ReportParams", "home_page", "error_page",
@@ -88,7 +89,7 @@ __all__ = ["application", "main", "serve", "run_report",
 # Form parameters (pure, unit-tested offline)
 
 _QUERY_RE = re.compile(r"^[A-Z][A-Z0-9 .,&\-]{0,59}$")
-_FORMS = ("10-K", "10-Q")
+_FORMS = ("10-K", "10-Q", "8-K", "DEF 14A")
 
 
 @dataclass
@@ -98,6 +99,8 @@ class ReportParams:
     risk_only: bool = False
     deletions_only: bool = False
     top: int | None = None
+    vs_year: int | None = None       # newer filing's year (default: latest)
+    base_year: int | None = None     # older filing's year (default: previous)
 
 
 def parse_report_form(data: str) -> ReportParams:
@@ -123,6 +126,21 @@ def parse_report_form(data: str) -> ReportParams:
     form = first("form", "10-K").upper()
     if form not in _FORMS:
         raise ValueError(f"Form must be one of: {', '.join(_FORMS)}.")
+
+    def parse_year(name: str, label: str) -> int | None:
+        raw = first(name)
+        if not raw:
+            return None
+        try:
+            year = int(raw)
+        except ValueError:
+            raise ValueError(f"“{label}” must be a year, e.g. 2024.") \
+                from None
+        if not 1990 <= year <= 2100:
+            raise ValueError(f"“{label}” must be a year between 1990 "
+                             "and 2100.")
+        return year
+
     top_raw = first("top")
     top: int | None = None
     if top_raw:
@@ -137,7 +155,9 @@ def parse_report_form(data: str) -> ReportParams:
         ticker=ticker, form=form,
         risk_only=first("risk_only") in ("on", "true", "1"),
         deletions_only=first("deletions_only") in ("on", "true", "1"),
-        top=top)
+        top=top,
+        vs_year=parse_year("vs_year", "Compare year"),
+        base_year=parse_year("base_year", "Against year"))
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +598,44 @@ def _stats(start_response, method: str, user: dict | None):
                                store.total_accounts(), _waitlist_count()))
 
 
+def _download(start_response, environ, method: str,
+              user: dict | None, visitor_id: str, cookie: list,
+              fmt: str):
+    """GET /report.csv and /report.xls — download a report's XBRL
+    numbers table.
+
+    Same rules as /report itself: the ticker is resolved first (unknown
+    tickers error out honestly, no slot consumed), the company counts
+    toward the same daily free limit by CIK whatever the form, and the
+    file carries exactly the values of the on-page table (export.py
+    formats with the same code the report uses).
+    """
+    if method not in ("GET", "HEAD"):
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the download links on "
+                      "a report page.", user)
+    params = parse_report_form(environ.get("QUERY_STRING", ""))
+    cik, _company = _resolve_company(params)
+    if not get_usage_store().check_and_add(
+            _usage_key(user, visitor_id), cik):
+        return _respond(start_response, "402 Payment Required",
+                        paywall_page(user), extra_headers=cookie)
+    summary, _page, xbrl = _compute_report(params, user)
+    _record("report", _report_key(summary, params))
+    stem = (f"secdiff-{params.ticker}-{params.form}"
+            .lower().replace(" ", "-").replace("/", "-"))
+    if fmt == "csv":
+        body, ctype, ext = xbrl_to_csv(xbrl), "text/csv; charset=utf-8", "csv"
+    else:
+        body, ctype, ext = (xbrl_to_xls(xbrl),
+                            "application/vnd.ms-excel; charset=utf-8", "xls")
+    return _respond(
+        start_response, "200 OK", body, ctype,
+        extra_headers=[("Content-Disposition",
+                        f'attachment; filename="{stem}-numbers.{ext}"'),
+                       *cookie])
+
+
 # ---------------------------------------------------------------------------
 # Running a report through the shared CLI pipeline
 
@@ -586,9 +644,11 @@ _RUN_LOCK = threading.Lock()
 
 def _cli_args(params: ReportParams) -> SimpleNamespace:
     """The args namespace the shared pipeline functions expect (mirrors
-    the CLI defaults: compare the latest filing against the previous one)."""
+    the CLI defaults: compare the latest filing against the previous
+    one, or the two explicitly chosen filing years)."""
     return SimpleNamespace(
         ticker=params.ticker, form=params.form, years=1,
+        vs_year=params.vs_year, base_year=params.base_year,
         risk_only=params.risk_only, deletions_only=params.deletions_only,
         top=params.top, section=None, summarize=False,
         email=None,
@@ -596,14 +656,15 @@ def _cli_args(params: ReportParams) -> SimpleNamespace:
         output="secdiff-out")
 
 
-def run_report(params: ReportParams,
-               user: dict | None = None) -> tuple[str, str]:
-    """Compute a report with the shared pipeline.
+def _compute_report(params: ReportParams,
+                    user: dict | None = None):
+    """Run the shared pipeline once.
 
-    Returns (one_line_summary, full_html_page). Pipeline failures
-    propagate: SystemExit with a human-readable message (unknown ticker,
-    not enough filings), urllib.error.URLError (EDGAR unreachable), or
-    anything else — the HTTP layer turns them into honest error pages.
+    Returns (one_line_summary, full_html_page, xbrl_result). Pipeline
+    failures propagate: SystemExit with a human-readable message
+    (unknown ticker, not enough filings, unknown year),
+    urllib.error.URLError (EDGAR unreachable), or anything else — the
+    HTTP layer turns them into honest error pages.
     """
     args = _cli_args(params)
     notes = io.StringIO()
@@ -611,18 +672,48 @@ def run_report(params: ReportParams,
         info, diffs, xbrl = live_pipeline(args)
         _md, page, counts = render_reports(args, info, diffs, xbrl)
     summary = one_line_summary(info, counts, xbrl)
-    return summary, _wrap_report(page, notes.getvalue().strip(), user)
+    downloads = None
+    if xbrl.rows:
+        # Pin the compared pair (real ticker + form) so the download
+        # reproduces THIS report's numbers table. The filing years are
+        # pinned too when they differ; when both filings are from the
+        # same year (routine for 8-Ks) a year pair cannot express the
+        # pair (and an equal pair is rejected as a same-year mistake),
+        # so the link falls back to the default latest-vs-prior pair.
+        q = {"ticker": info.ticker, "form": info.form}
+        if info.new_date[:4] != info.old_date[:4]:
+            q["vs_year"] = info.new_date[:4]
+            q["base_year"] = info.old_date[:4]
+        downloads = urllib.parse.urlencode(q)
+    return summary, _wrap_report(page, notes.getvalue().strip(), user,
+                                 downloads), xbrl
+
+
+def run_report(params: ReportParams,
+               user: dict | None = None) -> tuple[str, str]:
+    """Compute a report with the shared pipeline.
+
+    Returns (one_line_summary, full_html_page)."""
+    summary, page, _xbrl = _compute_report(params, user)
+    return summary, page
 
 
 def _wrap_report(report_html: str, notes: str,
-                 user: dict | None = None) -> str:
+                 user: dict | None = None,
+                 downloads: str | None = None) -> str:
     """Add a way back home (and any honest stderr notes, e.g. the ticker
     resolved to a different EDGAR entity) to the shared report page."""
     account_link = ("<a href='/account'>My account</a>" if user
                     else "<a href='/login'>Log in</a>")
     nav = ("<div style='max-width:920px;margin:1rem auto 0;padding:0 1rem'>"
            "<a href='/'>&larr; New secdiff search</a>"
-           f" &nbsp;·&nbsp; {account_link}</div>")
+           f" &nbsp;·&nbsp; {account_link}")
+    if downloads:
+        nav += (f" &nbsp;·&nbsp; <a href='/report.csv?{downloads}'>"
+                "Download numbers (CSV)</a>"
+                f" &nbsp;·&nbsp; <a href='/report.xls?{downloads}'>"
+                "Download numbers (Excel)</a>")
+    nav += "</div>"
     if notes:
         items = "".join(f"<div>{html.escape(line)}</div>"
                         for line in notes.splitlines() if line.strip())
@@ -731,9 +822,31 @@ what a company <em>stops saying</em> is often the story.</p>
       <select id="form" name="form">
         <option value="10-K" selected>10-K (annual)</option>
         <option value="10-Q">10-Q (quarterly)</option>
+        <option value="8-K">8-K (current / event report)</option>
+        <option value="DEF 14A">Proxy — DEF 14A (annual meeting)</option>
       </select>
     </div>
   </div>
+  <div class="row">
+    <div>
+      <label for="vs_year">Compare the filing from year
+        <span class="note">(optional — blank = latest)</span></label>
+      <input type="number" id="vs_year" name="vs_year" min="1990" max="2100"
+             placeholder="latest">
+    </div>
+    <div>
+      <label for="base_year">Against the filing from year
+        <span class="note">(optional — blank = the one before)</span></label>
+      <input type="number" id="base_year" name="base_year" min="1990"
+             max="2100" placeholder="previous">
+    </div>
+  </div>
+  <p class="note">Pick two years to compare those exact filings — for
+  example the 2025 10-K against the 2022 one. If a year you pick has no
+  filing of that form, the result page says so and lists the years that
+  do exist. Proxies (DEF 14A) are diffed in words only — they carry no
+  XBRL numbers table. 8-Ks are event filings, so the two compared usually
+  cover different events.</p>
   <label class="check"><input type="checkbox" name="risk_only">
     Risk factors only (Item 1A)</label>
   <label class="check"><input type="checkbox" name="deletions_only">
@@ -761,9 +874,10 @@ pre-generated reports here.</p>
 <ol>
 <li><strong>Fetch</strong> — secdiff resolves your ticker on SEC EDGAR
 (verifying the resolved company actually files the form you asked for),
-then downloads the latest filing and the one before it, plus the
-company's XBRL data. Downloads are cached, and requests are paced well
-under the SEC's fair-access limit of 10 requests/second.</li>
+then downloads the latest filing and the one before it — or the two
+filing years you chose — plus the company's XBRL data. Downloads are
+cached, and requests are paced well under the SEC's fair-access limit
+of 10 requests/second.</li>
 <li><strong>Split</strong> — each filing is split into its ITEM sections
 (Risk Factors, MD&amp;A, Financial Statements&hellip;). Detection is
 heuristic, so every report states its section-detection confidence
@@ -776,7 +890,9 @@ output, every time — no AI is involved in computing the diff.</li>
 filing by accession number across 100 tracked concepts, so each column
 is exactly what that filing reported. Concepts reported by only one
 filing (usually retags) are listed separately and never silently
-merged.</li>
+merged. The numbers table can be downloaded as CSV or Excel from the
+report page. Forms with no XBRL data (proxy statements) simply have
+no numbers table — nothing is invented to fill one.</li>
 <li><strong>Verify</strong> — every report links to both source filings
 on EDGAR, so any change can be checked against the original document in
 one click.</li>
@@ -818,7 +934,7 @@ def pricing_section() -> str:
     <div class="price">$9 <span>/ week</span></div>
     <ul>
       <li><strong>Unlimited companies</strong> while active</li>
-      <li>All features, 10-K and 10-Q</li>
+      <li>All features — 10-K, 10-Q, 8-K and proxy (DEF 14A)</li>
       <li>For a single earnings week deep-dive</li>
     </ul>
     <a class="btn" href="#waitlist">Payments opening soon — join the waitlist</a>
@@ -828,7 +944,7 @@ def pricing_section() -> str:
     <div class="price">$27 <span>/ month</span></div>
     <ul>
       <li><strong>Unlimited companies</strong> while active</li>
-      <li>All features, 10-K and 10-Q</li>
+      <li>All features — 10-K, 10-Q, 8-K and proxy (DEF 14A)</li>
       <li>Best value for following earnings season</li>
     </ul>
     <a class="btn" href="#waitlist">Payments opening soon — join the waitlist</a>
@@ -1312,6 +1428,10 @@ def application(environ, start_response):
             return _forgot_username(environ, start_response, method)
         if path == "/stats":
             return _stats(start_response, method, user)
+        if path in ("/report.csv", "/report.xls"):
+            return _download(start_response, environ, method, user,
+                             visitor_id, cookie,
+                             "csv" if path.endswith(".csv") else "xls")
         if path == "/report":
             if method == "POST":
                 raw = _read_body(environ)

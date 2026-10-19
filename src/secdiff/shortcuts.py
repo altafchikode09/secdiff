@@ -50,8 +50,8 @@ def resolve_section(name: str, form: str = "10-K") -> str:
     if key in SECTION_ALIASES:
         return SECTION_ALIASES[key]
     up = name.strip().upper()
-    from .sections import ITEM_TITLES
-    if up in ITEM_TITLES:
+    from .sections import ITEM_TITLES, ITEM_TITLES_8K
+    if up in ITEM_TITLES or up in ITEM_TITLES_8K:
         return up
     raise SystemExit(
         f"Unknown section '{name}'. Try: risk, mdna, business, legal, "

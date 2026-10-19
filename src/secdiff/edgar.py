@@ -49,6 +49,14 @@ class Filing:
     def accession_nodash(self) -> str:
         return self.accession.replace("-", "")
 
+    @property
+    def filing_year(self) -> int | None:
+        """Calendar year the filing was filed in (from filing_date)."""
+        try:
+            return int(self.filing_date[:4])
+        except (TypeError, ValueError):
+            return None
+
     def document_url(self, cik: int) -> str:
         return f"{BASE_ARCHIVES}/{cik}/{self.accession_nodash}/{self.primary_document}"
 
@@ -305,8 +313,15 @@ class EdgarClient:
         return self.resolve_ticker(ticker, form=form, min_count=min_count)
 
     # -- public API ----------------------------------------------------------
-    def recent_filings(self, cik: int, form: str, count: int = 2) -> list[Filing]:
-        """Return the `count` most recent filings of `form` (e.g. '10-K')."""
+    def all_filings(self, cik: int, form: str,
+                    count: int | None = None) -> list[Filing]:
+        """Filings of `form` for this entity, newest first.
+
+        With count=None every filing of the form in the entity's recent
+        EDGAR submission history is returned (this is the list the
+        any-two-filings compare picks its pair from). With a count, at
+        most that many are returned.
+        """
         subs = self._submissions(cik)
         recent = subs.get("filings", {}).get("recent", {})
         forms = recent.get("form", [])
@@ -320,8 +335,13 @@ class EdgarClient:
                     report_date=recent.get("reportDate", [""])[i] or "",
                     primary_document=recent["primaryDocument"][i],
                 ))
-            if len(out) == count:
+            if count is not None and len(out) == count:
                 break
+        return out
+
+    def recent_filings(self, cik: int, form: str, count: int = 2) -> list[Filing]:
+        """Return the `count` most recent filings of `form` (e.g. '10-K')."""
+        out = self.all_filings(cik, form, count=count)
         if len(out) < count:
             raise SystemExit(
                 f"Only {len(out)} {form} filing(s) found for CIK {cik}; need {count} to diff.")

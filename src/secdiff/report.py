@@ -32,6 +32,30 @@ class FilingInfo:
     section_confidence: str = "high"
 
 
+# Honest framing for forms whose diff needs a caveat up front. Shown in
+# every report (Markdown + HTML) for these forms, never silently.
+FORM_NOTES = {
+    "8-K": ("8-Ks are event filings: each one reports specific events "
+            "(results, deals, leadership changes…), so the two filings "
+            "compared here usually cover DIFFERENT events — many "
+            "additions are expected and do not by themselves mean "
+            "anything was hidden."),
+    "DEF 14A": ("Proxy statements (DEF 14A) are filed once a year for "
+                "the annual shareholder meeting; this compares the "
+                "latest proxy with the prior year's. Proxies carry no "
+                "XBRL financial-statement data, so there is no numbers "
+                "table for this form."),
+}
+
+
+def _no_xbrl_message(form: str) -> str:
+    """The honest line shown when the XBRL numbers table is empty."""
+    if form == "DEF 14A":
+        return ("Proxy statements carry no XBRL financial-statement "
+                "data, so there is no numbers table for this report.")
+    return "No matched XBRL concepts were reported by both filings."
+
+
 def _counts(diffs: list[SectionDiff]) -> tuple[int, int, int]:
     d = sum(1 for s in diffs for h in s.hunks if h.kind == "deletion")
     m = sum(1 for s in diffs for h in s.hunks if h.kind == "modification")
@@ -58,6 +82,8 @@ def render_markdown(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult
         out.append(f"- **XBRL coverage:** {xbrl.matched} of {xbrl.considered} "
                    "tracked concepts were reported by both filings")
     out.append(f"- Section-detection confidence: **{info.section_confidence}**")
+    if info.form in FORM_NOTES:
+        out.append(f"- **About this form:** {FORM_NOTES[info.form]}")
     out.append("")
     out.append("> Deterministic diff computed by code (no AI). "
                "This report is not investment advice.")
@@ -77,7 +103,7 @@ def render_markdown(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult
             out.append(f"| {r.label} | {fmt_money(r.old, r.unit)} | {fmt_money(r.new, r.unit)} "
                        f"| {fmt_money(r.change, r.unit)} | {pct} |")
     else:
-        out.append("_No matched XBRL concepts were reported by both filings._")
+        out.append(f"_{_no_xbrl_message(info.form)}_")
     if xbrl.unmapped:
         out.append("")
         out.append("**Retagged / unmapped concepts (listed, never merged):**")
@@ -89,7 +115,10 @@ def render_markdown(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult
         if not s.hunks:
             continue
         out.append("")
-        out.append(f"### Item {s.item} — {s.title}")
+        # "FULL" is the whole-document fallback (no ITEM sections were
+        # detected): its title already says what it is, with no "Item".
+        out.append(f"### {s.title}" if s.item == "FULL"
+                   else f"### Item {s.item} — {s.title}")
         out.append(f"_Source: [older filing]({info.old_url}) vs "
                    f"[newer filing]({info.new_url})_")
         out.append("")
@@ -150,7 +179,11 @@ def render_html(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult,
                  f"filings.</div>")
     p.append(f"<div class='note'>Section-detection confidence: "
              f"{e(info.section_confidence)}. Deterministic diff computed by code "
-             f"(no AI). Not investment advice.</div></div>")
+             f"(no AI). Not investment advice.</div>")
+    if info.form in FORM_NOTES:
+        p.append(f"<div class='note'><strong>About this form:</strong> "
+                 f"{e(FORM_NOTES[info.form])}</div>")
+    p.append("</div>")
     if summary:
         p.append(f"<h2>Summary ({e(summary_kind)})</h2>")
         for ln in summary:
@@ -168,7 +201,7 @@ def render_html(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult,
                      f"<td class='{cls}'>{pct}</td></tr>")
         p.append("</table>")
     else:
-        p.append("<p><em>No matched XBRL concepts were reported by both filings.</em></p>")
+        p.append(f"<p><em>{e(_no_xbrl_message(info.form))}</em></p>")
     if xbrl.unmapped:
         p.append("<p><strong>Retagged / unmapped concepts (listed, never merged):</strong></p><ul>")
         for u in xbrl.unmapped:
@@ -178,7 +211,10 @@ def render_html(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult,
     for s in diffs:
         if not s.hunks:
             continue
-        p.append(f"<h3>Item {e(s.item)} — {e(s.title)}</h3>")
+        if s.item == "FULL":    # whole-document fallback section
+            p.append(f"<h3>{e(s.title)}</h3>")
+        else:
+            p.append(f"<h3>Item {e(s.item)} — {e(s.title)}</h3>")
         p.append(f"<p class='note'>Source: <a href='{e(info.old_url)}'>older filing</a>"
                  f" vs <a href='{e(info.new_url)}'>newer filing</a></p>")
         for h in s.hunks:

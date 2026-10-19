@@ -84,9 +84,12 @@ export EDGAR_EMAIL=you@example.com
 python -m secdiff.web        # or: secdiff serve  |  secdiff-web
 ```
 
-Open **http://127.0.0.1:8000** — type a ticker, pick 10-K/10-Q,
-optionally tick *Risk factors only* / *Deletions only* or set *Top N*,
-and the report renders in the browser. Every web report is generated
+Open **http://127.0.0.1:8000** — type a ticker, pick a form (10-K,
+10-Q, 8-K or proxy DEF 14A), optionally tick *Risk factors only* /
+*Deletions only*, set *Top N*, or pick two filing years to compare
+those exact filings, and the report renders in the browser. Reports
+with an XBRL numbers table offer CSV and Excel downloads of that table
+(the exact values shown on the page). Every web report is generated
 live from real SEC EDGAR filings at request time — there is no demo or
 pre-generated report on the website. Unknown tickers and EDGAR outages
 produce an honest error page, never fake data.
@@ -108,6 +111,10 @@ XBRL, paced under SEC fair access); repeat visits are cached and fast.
 | `secdiff TICKER` | Zero-config quick mode: fetch → diff → HTML + Markdown reports + one-line terminal summary |
 | `secdiff demo` | Offline demo on bundled real filings |
 | `--form 10-Q` | Compare 10-Qs instead of 10-Ks (compares the two most recent 10-Qs — consecutive quarters, see Limitations) |
+| `--form 8-K` | Compare the two most recent 8-K event filings (labelled in the report: 8-Ks cover different events, so additions are expected) |
+| `--form "DEF 14A"` | Compare the latest proxy statement with the prior year's (words only — proxies carry no XBRL numbers table, and the report says so) |
+| `--vs-year Y` / `--base-year Y` | Compare two exact filing years (e.g. `--vs-year 2025 --base-year 2022`); years with no such filing are an honest error listing the years that exist |
+| `--export-csv PATH` | Also write the XBRL numbers table to PATH as CSV — exactly the values shown in the report |
 | `--risk-only` | Only Item 1A — Risk Factors |
 | `--deletions-only` | Only removed text — the headline use case |
 | `--top N` | Only the N biggest changes overall (sections ranked by change size) |
@@ -282,6 +289,11 @@ placeholder identities.
   10-Qs), not the same quarter a year apart.
 - **Filing text is the primary document only** — exhibits (EX-99 etc.)
   are not diffed in v1.
+- **Proxy (DEF 14A) heading styles vary wildly** between filers and are
+  often split across lines by inline-XBRL layout, so proposal sections
+  cannot always be detected. When no sections are detected in either
+  proxy, secdiff diffs the whole documents as one clearly labelled
+  section (confidence: low) instead of reporting an empty diff.
 - The demo filings are a frozen snapshot from 2026-10-17; live runs
   always fetch the current latest filings.
 

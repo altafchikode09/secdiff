@@ -39,6 +39,49 @@ _HEADING_RE = re.compile(
     r"(?im)^\s*ITEM\s+(1[0-5]|1A|1B|7A|9A|9B|[1-9])\b\s*[.\-—:)]?\s*([A-Z][^\n]{0,90})?$"
 )
 
+# 8-K items are decimal-numbered ("Item 2.02 Results of Operations…") and
+# mean completely different things from the same leading digit in a 10-K,
+# so 8-Ks get their own heading pattern and their own title table. The
+# 10-K/10-Q pattern above is deliberately left untouched.
+_HEADING_RE_DECIMAL = re.compile(
+    r"(?im)^\s*ITEM\s+([1-9]\.\d{2}|1[0-5]|1A|1B|7A|9A|9B|[1-9])\b\s*[.\-—:)]?\s*([A-Z][^\n]{0,90})?$"
+)
+
+# Canonical Form 8-K items (SEC Form 8-K item list).
+ITEM_TITLES_8K = {
+    "1.01": "Entry into a Material Definitive Agreement",
+    "1.02": "Termination of a Material Definitive Agreement",
+    "1.03": "Bankruptcy or Receivership",
+    "1.04": "Mine Safety — Reporting of Shutdowns and Patterns of Violations",
+    "2.01": "Completion of Acquisition or Disposition of Assets",
+    "2.02": "Results of Operations and Financial Condition",
+    "2.03": "Creation of a Direct Financial Obligation",
+    "2.04": "Triggering Events That Accelerate or Increase a Direct Financial Obligation",
+    "2.05": "Costs Associated with Exit or Disposal Activities",
+    "2.06": "Material Impairments",
+    "3.01": "Notice of Delisting or Failure to Satisfy a Continued Listing Rule",
+    "3.02": "Unregistered Sales of Equity Securities",
+    "3.03": "Material Modification to Rights of Security Holders",
+    "4.01": "Changes in Registrant's Certifying Accountant",
+    "4.02": "Non-Reliance on Previously Issued Financial Statements",
+    "5.01": "Changes in Control of Registrant",
+    "5.02": "Departure of Directors or Certain Officers; Election of Directors",
+    "5.03": "Amendments to Articles of Incorporation or Bylaws",
+    "5.04": "Temporary Suspension of Trading Under Registrant's Employee Benefit Plans",
+    "5.05": "Amendments to the Registrant's Code of Ethics",
+    "5.06": "Change in Shell Company Status",
+    "5.07": "Submission of Matters to a Vote of Security Holders",
+    "5.08": "Shareholder Director Nominations",
+    "6.01": "ABS Informational and Computational Material",
+    "6.02": "Change of Servicer or Trustee",
+    "6.03": "Change in Credit Enhancement or Other External Support",
+    "6.04": "Failure to Make a Required Distribution",
+    "6.05": "Securities Act Updating Disclosure",
+    "7.01": "Regulation FD Disclosure",
+    "8.01": "Other Events",
+    "9.01": "Financial Statements and Exhibits",
+}
+
 
 @dataclass
 class Section:
@@ -56,7 +99,17 @@ class SplitResult:
 
 
 def split_sections(text: str, form: str = "10-K") -> SplitResult:
-    matches = list(_HEADING_RE.finditer(text))
+    if form == "8-K":
+        heading_re, titles = _HEADING_RE_DECIMAL, ITEM_TITLES_8K
+    elif form == "DEF 14A":
+        # Proxy items are meeting proposals ("ITEM 1. Election of
+        # Directors"), NOT 10-K items — the 10-K title table would call
+        # Item 1 "Business", which is simply wrong here. Use no canned
+        # titles: the heading's own text (or "Item N") is the title.
+        heading_re, titles = _HEADING_RE, {}
+    else:
+        heading_re, titles = _HEADING_RE, ITEM_TITLES
+    matches = list(heading_re.finditer(text))
     # A table of contents lists every item early in the document; the real
     # body headings come later. Heuristic: if we see the same item twice,
     # keep the LAST occurrence as the body start.
@@ -72,7 +125,7 @@ def split_sections(text: str, form: str = "10-K") -> SplitResult:
         body = text[start:end].strip()
         if len(body) < 40:  # heading with no real body — treat as not found
             continue
-        title = ITEM_TITLES.get(item) or ((m.group(2) or "").strip().title() or f"Item {item}")
+        title = titles.get(item) or ((m.group(2) or "").strip().title() or f"Item {item}")
         conf = "high" if len(body) > 500 else "low"
         sections[item] = Section(item=item, title=title, text=body, confidence=conf)
 
@@ -85,7 +138,15 @@ def split_sections(text: str, form: str = "10-K") -> SplitResult:
         for item, s in sections.items():
             if item in titles_10q:
                 s.title = titles_10q[item]
-    expected = ["1", "1A", "7", "8"] if form == "10-K" else ["1", "1A", "2"]
+    if form == "10-K":
+        expected = ["1", "1A", "7", "8"]
+    elif form == "10-Q":
+        expected = ["1", "1A", "2"]
+    else:
+        # 8-K / DEF 14A: there is no canonical item set every filing must
+        # carry (an 8-K reports only the items its events need), so
+        # nothing is ever reported "missing" for these forms.
+        expected = []
     missing = [i for i in expected if i not in sections]
     overall = "high" if len(sections) >= 4 and not missing else "low"
     return SplitResult(sections=sections, missing=missing, confidence=overall)

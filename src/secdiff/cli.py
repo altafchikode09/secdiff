@@ -10,14 +10,24 @@ an HTML + a Markdown report, and print a one-line summary.
 Shortcuts:
     secdiff demo                 offline, bundled REAL filings, no network
     secdiff AAPL --form 10-Q     compare 10-Qs instead of 10-Ks
+    secdiff AAPL --form 8-K      compare the last two 8-K event filings
+    secdiff AAPL --form "DEF 14A"  compare the last two proxy statements
     secdiff AAPL --risk-only     only Item 1A Risk Factors
     secdiff AAPL --deletions-only  only removed text
     secdiff AAPL --top 20        only the 20 biggest changes
     secdiff AAPL --section mdna  just one section (risk, mdna, business…)
     secdiff AAPL --years 2       compare against the filing 2 years back
+    secdiff AAPL --base-year 2022  compare the latest filing against 2022's
+    secdiff AAPL --vs-year 2025 --base-year 2022
+                                 compare the 2025 filing against 2022's
+    secdiff AAPL --export-csv FILE  also save the XBRL numbers table as CSV
     secdiff AAPL --output DIR    choose where reports go
     secdiff AAPL --summarize     add a summary of the computed diff
     secdiff serve                run the web front end (see secdiff.web)
+
+Supported forms: 10-K, 10-Q, 8-K and DEF 14A (proxy). 8-Ks are event
+filings and proxies carry no XBRL numbers table; both are labelled as
+such in their reports rather than presented as if they were 10-Ks.
 """
 from __future__ import annotations
 
@@ -28,16 +38,38 @@ from pathlib import Path
 
 from .diffing import diff_section
 from .edgar import EdgarClient, Filing
+from .export import xbrl_to_csv
 from .report import FilingInfo, _counts, render_html, render_markdown
 from .sections import split_sections
 from .shortcuts import filter_diffs, resolve_section
 from .summarize import extractive_summary, llm_summary
 from .xbrl import compute_delta
 
+# Every form the diff pipeline supports end to end.
+SUPPORTED_FORMS = ["10-K", "10-Q", "8-K", "DEF 14A"]
+
 
 def build_diffs(old_text: str, new_text: str, form: str):
     old_split = split_sections(old_text, form)
     new_split = split_sections(new_text, form)
+    if not old_split.sections and not new_split.sections \
+            and (old_text.strip() or new_text.strip()):
+        # No ITEM/Proposal headings could be detected in EITHER document
+        # (common for proxy statements, whose heading styles vary wildly
+        # and are often split across lines by inline-XBRL layout). An
+        # empty report would silently claim "nothing changed", which is
+        # false — diff the whole documents as one clearly labelled
+        # section instead. Section confidence stays "low" (it is, since
+        # no sections were detected), so the caveat is visible.
+        # The hunk cap is far larger than the per-section one: with a
+        # single section, the usual cap of 60 (deletions first) would
+        # show ONLY deletions and report totals that hide every
+        # modification and addition in the document.
+        return [diff_section(
+            "FULL",
+            "Full document — no ITEM sections detected in either "
+            "filing, so the whole documents were diffed",
+            old_text, new_text, max_hunks=2000)], "low"
     diffs = []
     items = sorted(set(old_split.sections) | set(new_split.sections),
                    key=lambda x: (len(x), x))
@@ -91,7 +123,8 @@ def one_line_summary(info: FilingInfo, counts, xbrl) -> str:
 def finish(args, info: FilingInfo, diffs, xbrl, out_dir: Path) -> int:
     md, ht, counts = render_reports(args, info, diffs, xbrl)
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"secdiff-{info.ticker}-{info.form}".lower().replace("/", "-")
+    stem = f"secdiff-{info.ticker}-{info.form}".lower() \
+        .replace("/", "-").replace(" ", "-")
     md_path = out_dir / f"{stem}.md"
     html_path = out_dir / f"{stem}.html"
     md_path.write_text(md, encoding="utf-8")
@@ -99,6 +132,13 @@ def finish(args, info: FilingInfo, diffs, xbrl, out_dir: Path) -> int:
     print(one_line_summary(info, counts, xbrl))
     print(f"HTML report: {html_path.resolve()}")
     print(f"Markdown report: {md_path.resolve()}")
+    export_csv = getattr(args, "export_csv", None)
+    if export_csv:
+        csv_path = Path(export_csv)
+        if csv_path.parent and str(csv_path.parent) not in ("", "."):
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_path.write_text(xbrl_to_csv(xbrl), encoding="utf-8")
+        print(f"CSV numbers table: {csv_path.resolve()}")
     return 0
 
 
@@ -144,13 +184,20 @@ def live_pipeline(args):
     cache = Path(args.cache_dir) if args.cache_dir else \
         Path.home() / ".cache" / "secdiff"
     client = EdgarClient(email=email, cache_dir=cache)
-    want = args.years + 1
+    vs_year = getattr(args, "vs_year", None)
+    base_year = getattr(args, "base_year", None)
+    year_mode = vs_year is not None or base_year is not None
+    want = 2 if year_mode else args.years + 1
     # Resolve the ticker to the entity that actually files this form —
     # EDGAR's ticker files can point at a related entity that never does.
     cik, company = client.resolve_ticker(args.ticker, form=args.form,
                                          min_count=want)
-    filings = client.recent_filings(cik, args.form, count=want)
-    newer, older = filings[0], filings[args.years]
+    if year_mode:
+        newer, older = _pick_filings_by_year(
+            client.all_filings(cik, args.form), args.form, vs_year, base_year)
+    else:
+        filings = client.recent_filings(cik, args.form, count=want)
+        newer, older = filings[0], filings[args.years]
     new_text = client.filing_text(cik, newer)
     old_text = client.filing_text(cik, older)
     diffs, conf = build_diffs(old_text, new_text, args.form)
@@ -169,6 +216,71 @@ def live_pipeline(args):
     return info, diffs, xbrl
 
 
+def _pick_filings_by_year(filings: list[Filing], form: str,
+                          vs_year: int | None,
+                          base_year: int | None) -> tuple[Filing, Filing]:
+    """Pick the (newer, older) pair for an explicit-year compare.
+
+    `vs_year` names the newer filing's filing year (default: the latest
+    filing); `base_year` names the older one's (default: the filing
+    immediately before the newer one). Only years in which the company
+    really filed this form are accepted — anything else is an honest
+    error listing the years that do exist; the pair is never guessed.
+    When several filings of the form share a year (routine for 8-Ks,
+    which can be filed many times a year), the year's LATEST filing is
+    used and the caller can narrow further with the other options.
+    """
+    if len(filings) < 2:
+        raise SystemExit(
+            f"Only {len(filings)} {form} filing(s) found on EDGAR; "
+            "need 2 to diff.")
+    years = sorted({f.filing_year for f in filings
+                    if f.filing_year is not None}, reverse=True)
+
+    def find(year: int, newest: bool) -> Filing | None:
+        matches = [f for f in filings if f.filing_year == year]
+        if not matches:
+            return None
+        return matches[0] if newest else matches[-1]
+
+    if vs_year is not None:
+        newer = find(vs_year, newest=True)
+        if newer is None:
+            raise SystemExit(
+                f"No {form} filing from {vs_year} on EDGAR for this "
+                f"company. Filing years available: "
+                f"{', '.join(map(str, years))}.")
+    else:
+        newer = filings[0]
+    if base_year is not None:
+        if vs_year is not None and base_year == vs_year:
+            raise SystemExit(
+                f"--base-year and --vs-year are both {base_year}: a "
+                "filing cannot be compared with itself. Pick two "
+                "different years.")
+        older = find(base_year, newest=False)
+        if older is None:
+            raise SystemExit(
+                f"No {form} filing from {base_year} on EDGAR for this "
+                f"company. Filing years available: "
+                f"{', '.join(map(str, years))}.")
+    else:
+        idx = filings.index(newer)
+        if idx + 1 >= len(filings):
+            raise SystemExit(
+                f"The {newer.filing_date} {form} is the oldest one on "
+                "EDGAR for this company — there is no earlier filing "
+                "to compare it against.")
+        older = filings[idx + 1]
+    if filings.index(older) <= filings.index(newer):
+        raise SystemExit(
+            f"The 'older' filing ({older.filing_date}) is not older "
+            f"than the 'newer' one ({newer.filing_date}). Check the "
+            "two years: --vs-year must be the later filing, "
+            "--base-year the earlier one.")
+    return newer, older
+
+
 def run_live(args) -> int:
     info, diffs, xbrl = live_pipeline(args)
     return finish(args, info, diffs, xbrl, Path(args.output))
@@ -182,10 +294,19 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("ticker", help="Ticker symbol (e.g. AAPL) or company name "
                                   "(e.g. Microsoft), or 'demo' for the bundled "
                                   "offline demo")
-    p.add_argument("--form", default="10-K", choices=["10-K", "10-Q"],
+    p.add_argument("--form", default="10-K", choices=SUPPORTED_FORMS,
                    help="Filing form to compare (default: 10-K)")
     p.add_argument("--years", type=int, default=1,
                    help="Compare against the filing N years back (default: 1)")
+    p.add_argument("--vs-year", type=int, default=None, metavar="YEAR",
+                   help="Compare the filing from YEAR (the newer side) "
+                        "instead of the latest filing")
+    p.add_argument("--base-year", type=int, default=None, metavar="YEAR",
+                   help="Compare against the filing from YEAR (the older "
+                        "side) instead of the previous filing")
+    p.add_argument("--export-csv", default=None, metavar="PATH",
+                   help="Also write the XBRL numbers table to PATH as CSV "
+                        "(exactly the values shown in the report)")
     p.add_argument("--output", default="secdiff-out",
                    help="Output directory for reports (default: ./secdiff-out)")
     p.add_argument("--section", default=None,

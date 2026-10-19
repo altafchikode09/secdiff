@@ -37,3 +37,42 @@ def test_addition_detected():
 def test_identical_text_no_hunks():
     d = diff_section("7", "MD&A", OLD, OLD)
     assert d.hunks == []
+
+
+# -- whole-document fallback (build_diffs) ---------------------------------
+# When section splitting finds no ITEM/Proposal headings in EITHER
+# document (common for real proxy statements), build_diffs must diff
+# the whole documents as one labelled FULL section — an empty report
+# would silently claim nothing changed.
+
+from secdiff.cli import build_diffs
+
+_NO_HEADINGS_OLD = (
+    "The board recommends every proposal in this statement to all "
+    "shareholders of record at the close of business this year. "
+    "Executive pay rose for the chief executive during the past year.")
+_NO_HEADINGS_NEW = (
+    "The board recommends every proposal in this statement to all "
+    "shareholders of record at the close of business this year. "
+    "A brand new shareholder proposal appears in this statement now.")
+
+
+def test_full_document_fallback_when_no_sections():
+    diffs, conf = build_diffs(_NO_HEADINGS_OLD, _NO_HEADINGS_NEW,
+                              "DEF 14A")
+    assert conf == "low"
+    assert len(diffs) == 1 and diffs[0].item == "FULL"
+    kinds = {h.kind for h in diffs[0].hunks}
+    assert "deletion" in kinds and "addition" in kinds
+
+
+def test_no_fallback_when_sections_exist():
+    old = ("ITEM 1A. Risk Factors\n"
+           "The company faces many serious risks in its markets today "
+           "and those risks could materially harm results of operations.")
+    new = ("ITEM 1A. Risk Factors\n"
+           "The company faces many serious risks in its markets today "
+           "and those risks could materially harm results of operations "
+           "plus a newly added supply chain risk sentence appears here.")
+    diffs, _conf = build_diffs(old, new, "10-K")
+    assert diffs and all(d.item != "FULL" for d in diffs)
