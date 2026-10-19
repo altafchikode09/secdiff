@@ -26,6 +26,14 @@ Open **http://127.0.0.1:8000**
   repeat visits are fast.
 - Unknown tickers and EDGAR outages get an honest error page — the site
   never shows invented data.
+- On a report page: **search in this report** (`?q=` — only the
+  changes mentioning a word or phrase, counted honestly, applied after
+  the other filters), a **share link** that reproduces the exact same
+  report, a **summary PDF** download (`/report.pdf`), the XBRL numbers
+  as CSV/Excel (`/report.csv`, `/report.xls`), and a **share card**
+  image (`/card`, a 1200×630 PNG with the counts, the
+  change-intensity score and the biggest deletion). Downloads and the
+  card follow the same 4-companies-a-day accounting as reports.
 
 ## Configuration
 

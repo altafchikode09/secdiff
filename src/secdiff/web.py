@@ -74,9 +74,13 @@ from types import SimpleNamespace
 
 from . import accounts as _accounts
 from .accounts import AccountStore
-from .cli import live_pipeline, one_line_summary, render_reports
+from .card import build_card_data, render_card_png
+from .cli import _filtered_diffs, live_pipeline, one_line_summary, \
+    render_reports
 from .edgar import EdgarClient
 from .export import xbrl_to_csv, xbrl_to_xls
+from .pdf import render_pdf
+from .search import clean_search_term
 
 __all__ = ["application", "main", "serve", "run_report",
            "parse_report_form", "ReportParams", "home_page", "error_page",
@@ -101,6 +105,7 @@ class ReportParams:
     top: int | None = None
     vs_year: int | None = None       # newer filing's year (default: latest)
     base_year: int | None = None     # older filing's year (default: previous)
+    q: str = ""                      # search-in-report term ("" = no search)
 
 
 def parse_report_form(data: str) -> ReportParams:
@@ -157,7 +162,10 @@ def parse_report_form(data: str) -> ReportParams:
         deletions_only=first("deletions_only") in ("on", "true", "1"),
         top=top,
         vs_year=parse_year("vs_year", "Compare year"),
-        base_year=parse_year("base_year", "Against year"))
+        base_year=parse_year("base_year", "Against year"),
+        # clean_search_term raises ValueError on an unsafe/unusable
+        # term — the usual honest 400 — and returns "" for no search.
+        q=clean_search_term(first("q")))
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +644,78 @@ def _download(start_response, environ, method: str,
                        *cookie])
 
 
+def _report_stem(params: ReportParams, info=None) -> str:
+    """Filename stem shared by the PDF and card downloads."""
+    ticker = info.ticker if info is not None else params.ticker
+    return (f"secdiff-{ticker}-{params.form}"
+            .lower().replace(" ", "-").replace("/", "-"))
+
+
+def _pdf_download(start_response, environ, method: str,
+                  user: dict | None, visitor_id: str, cookie: list):
+    """GET /report.pdf — the report's summary PDF.
+
+    Same accounting as /report itself: resolve first (unknown tickers
+    error honestly, no slot consumed), then the same daily free limit
+    by CIK. The PDF summarises the whole (option-filtered) report —
+    header, counts, score, top deletions (see secdiff.pdf)."""
+    if method not in ("GET", "HEAD"):
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the download links on "
+                      "a report page.", user)
+    params = parse_report_form(environ.get("QUERY_STRING", ""))
+    cik, _company = _resolve_company(params)
+    if not get_usage_store().check_and_add(
+            _usage_key(user, visitor_id), cik):
+        return _respond(start_response, "402 Payment Required",
+                        paywall_page(user), extra_headers=cookie)
+    info, diffs, xbrl = _compute_data(params)
+    _record("report", info.ticker)
+    body = render_pdf(info, diffs, xbrl)
+    filename = f"{_report_stem(params, info)}-{info.new_date}.pdf"
+    return _respond(
+        start_response, "200 OK", body, "application/pdf",
+        extra_headers=[("Content-Disposition",
+                        f'attachment; filename="{filename}"'),
+                       *cookie])
+
+
+def _card(start_response, environ, method: str,
+          user: dict | None, visitor_id: str, cookie: list):
+    """GET /card — the report's share card as a downloadable PNG.
+
+    Same accounting as /report: resolve first, then the daily free
+    limit by CIK. An unknown ticker/company is a plain 404 here (the
+    card simply does not exist), never a fake image."""
+    if method not in ("GET", "HEAD"):
+        return _error(start_response, "405 Method Not Allowed",
+                      "Method not allowed", "Use the share-card link on "
+                      "a report page.", user)
+    params = parse_report_form(environ.get("QUERY_STRING", ""))
+    try:
+        cik, _company = _resolve_company(params)
+    except SystemExit as exc:
+        msg = str(exc.code) if exc.code else "Company not found."
+        return _error(start_response, "404 Not Found", "Company not found",
+                      msg, user)
+    if not get_usage_store().check_and_add(
+            _usage_key(user, visitor_id), cik):
+        return _respond(start_response, "402 Payment Required",
+                        paywall_page(user), extra_headers=cookie)
+    info, diffs, xbrl = _compute_data(params)
+    _record("report", info.ticker)
+    host = environ.get("HTTP_HOST") or "secdiff.onrender.com"
+    report_url = (f"https://{host}/report?"
+                  f"{_canonical_query(info, params)}")
+    body = render_card_png(build_card_data(info, diffs, xbrl, report_url))
+    filename = f"{_report_stem(params, info)}-card.png"
+    return _respond(
+        start_response, "200 OK", body, "image/png",
+        extra_headers=[("Content-Disposition",
+                        f'attachment; filename="{filename}"'),
+                       *cookie])
+
+
 # ---------------------------------------------------------------------------
 # Running a report through the shared CLI pipeline
 
@@ -651,9 +731,48 @@ def _cli_args(params: ReportParams) -> SimpleNamespace:
         vs_year=params.vs_year, base_year=params.base_year,
         risk_only=params.risk_only, deletions_only=params.deletions_only,
         top=params.top, section=None, summarize=False,
+        search=params.q or None, search_base_url="",
         email=None,
         cache_dir=os.environ.get("SECDIFF_CACHE_DIR") or None,
         output="secdiff-out")
+
+
+def _pin_years(q: dict, info) -> None:
+    """Pin the compared pair's filing years into a canonical query
+    dict — but only when the two years differ. When both filings are
+    from the same year (routine for 8-Ks) a year pair cannot express
+    the pair (and an equal pair is rejected as a same-year mistake),
+    so the link falls back to the default latest-vs-prior pair."""
+    if info.new_date[:4] != info.old_date[:4]:
+        q["vs_year"] = info.new_date[:4]
+        q["base_year"] = info.old_date[:4]
+
+
+def _numbers_query(info) -> str:
+    """Canonical query for the numbers downloads: real ticker + form +
+    the compared pair, so the file reproduces THIS report's table."""
+    q = {"ticker": info.ticker, "form": info.form}
+    _pin_years(q, info)
+    return urllib.parse.urlencode(q)
+
+
+def _canonical_query(info, params: ReportParams) -> str:
+    """The canonical report query: the share/PDF/card links' target.
+
+    Real (resolved) ticker + form + the compared filing pair + every
+    display option, so opening the URL reproduces the exact same
+    report, counts included. The search term is deliberately NOT part
+    of it — a share link names the report, not one visitor's search
+    view of it."""
+    q = {"ticker": info.ticker, "form": info.form}
+    _pin_years(q, info)
+    if params.risk_only:
+        q["risk_only"] = "1"
+    if params.deletions_only:
+        q["deletions_only"] = "1"
+    if params.top is not None:
+        q["top"] = str(params.top)
+    return urllib.parse.urlencode(q)
 
 
 def _compute_report(params: ReportParams,
@@ -670,23 +789,31 @@ def _compute_report(params: ReportParams,
     notes = io.StringIO()
     with _RUN_LOCK, redirect_stderr(notes):
         info, diffs, xbrl = live_pipeline(args)
+        canonical = _canonical_query(info, params)
+        if params.q:
+            # The banner's "show the full report" link: this exact
+            # report, without the search filter.
+            args.search_base_url = f"/report?{canonical}"
         _md, page, counts = render_reports(args, info, diffs, xbrl)
     summary = one_line_summary(info, counts, xbrl)
-    downloads = None
-    if xbrl.rows:
-        # Pin the compared pair (real ticker + form) so the download
-        # reproduces THIS report's numbers table. The filing years are
-        # pinned too when they differ; when both filings are from the
-        # same year (routine for 8-Ks) a year pair cannot express the
-        # pair (and an equal pair is rejected as a same-year mistake),
-        # so the link falls back to the default latest-vs-prior pair.
-        q = {"ticker": info.ticker, "form": info.form}
-        if info.new_date[:4] != info.old_date[:4]:
-            q["vs_year"] = info.new_date[:4]
-            q["base_year"] = info.old_date[:4]
-        downloads = urllib.parse.urlencode(q)
+    downloads = _numbers_query(info) if xbrl.rows else None
     return summary, _wrap_report(page, notes.getvalue().strip(), user,
-                                 downloads), xbrl
+                                 downloads, canonical, params.q), xbrl
+
+
+def _compute_data(params: ReportParams):
+    """Run the shared pipeline for the non-HTML surfaces (PDF, share
+    card): returns (info, filtered_diffs, xbrl_result) — the diffs are
+    filtered by exactly the same options logic the HTML report uses
+    (cli._filtered_diffs), and the search term is ignored: a PDF or a
+    card always summarises the whole (option-filtered) report."""
+    args = _cli_args(params)
+    args.search = None
+    notes = io.StringIO()
+    with _RUN_LOCK, redirect_stderr(notes):
+        info, diffs, xbrl = live_pipeline(args)
+        diffs = _filtered_diffs(args, diffs)
+    return info, diffs, xbrl
 
 
 def run_report(params: ReportParams,
@@ -698,22 +825,83 @@ def run_report(params: ReportParams,
     return summary, page
 
 
+_SHARE_JS = """
+<script>
+document.getElementById('copy-share').addEventListener('click', function () {
+  var input = document.getElementById('share-url');
+  var url = input.value;
+  if (url.charAt(0) === '/') { url = location.origin + url; }
+  function done() {
+    var b = document.getElementById('copy-share');
+    b.textContent = 'Copied \\u2713';
+    setTimeout(function () { b.textContent = 'Copy share link'; }, 2000);
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url).then(done, function () {
+      input.value = url; input.select(); document.execCommand('copy'); done();
+    });
+  } else { input.value = url; input.select(); document.execCommand('copy'); done(); }
+});
+</script>
+"""
+
+
 def _wrap_report(report_html: str, notes: str,
                  user: dict | None = None,
-                 downloads: str | None = None) -> str:
+                 downloads: str | None = None,
+                 canonical: str = "",
+                 search_q: str = "") -> str:
     """Add a way back home (and any honest stderr notes, e.g. the ticker
-    resolved to a different EDGAR entity) to the shared report page."""
+    resolved to a different EDGAR entity) to the shared report page,
+    together with the download links, the share-link box and the
+    search-in-report form."""
     account_link = ("<a href='/account'>My account</a>" if user
                     else "<a href='/login'>Log in</a>")
     nav = ("<div style='max-width:920px;margin:1rem auto 0;padding:0 1rem'>"
            "<a href='/'>&larr; New secdiff search</a>"
            f" &nbsp;·&nbsp; {account_link}")
+    if canonical:
+        nav += (f" &nbsp;·&nbsp; <a href='/report.pdf?{canonical}'>"
+                "Download PDF</a>"
+                f" &nbsp;·&nbsp; <a href='/card?{canonical}'>"
+                "Share card (PNG)</a>")
     if downloads:
         nav += (f" &nbsp;·&nbsp; <a href='/report.csv?{downloads}'>"
                 "Download numbers (CSV)</a>"
                 f" &nbsp;·&nbsp; <a href='/report.xls?{downloads}'>"
                 "Download numbers (Excel)</a>")
     nav += "</div>"
+    if canonical:
+        share_url = f"/report?{canonical}"
+        hidden = "".join(
+            f"<input type='hidden' name='{html.escape(k, quote=True)}' "
+            f"value='{html.escape(v, quote=True)}'>"
+            for k, v in urllib.parse.parse_qsl(canonical))
+        nav += (
+            "<div style='max-width:920px;margin:.6rem auto 0;"
+            "padding:.6rem 1rem;background:#f3f4f6;border-radius:6px;"
+            "font-size:.92rem'>"
+            "<label for='share-url' style='font-weight:600'>Share this "
+            "report:</label> "
+            f"<input type='text' id='share-url' readonly "
+            f"value='{html.escape(share_url, quote=True)}' "
+            "style='width:min(480px,90%);font-size:.9rem;padding:.3rem .45rem'> "
+            "<button type='button' id='copy-share' "
+            "style='margin-top:0;padding:.35rem .8rem;font-size:.9rem'>"
+            "Copy share link</button>"
+            "<form method='get' action='/report' "
+            "style='margin-top:.6rem'>"
+            f"{hidden}"
+            "<label for='q' style='font-weight:600'>Search in this "
+            "report:</label> "
+            f"<input type='text' id='q' name='q' maxlength='80' "
+            f"value='{html.escape(search_q, quote=True)}' "
+            "placeholder='e.g. lawsuit, going concern' "
+            "style='width:min(300px,80%);font-size:.9rem;"
+            "padding:.3rem .45rem'> "
+            "<button type='submit' style='margin-top:0;"
+            "padding:.35rem .8rem;font-size:.9rem'>Search</button>"
+            "</form></div>" + _SHARE_JS)
     if notes:
         items = "".join(f"<div>{html.escape(line)}</div>"
                         for line in notes.splitlines() if line.strip())
@@ -895,7 +1083,10 @@ report page. Forms with no XBRL data (proxy statements) simply have
 no numbers table — nothing is invented to fill one.</li>
 <li><strong>Verify</strong> — every report links to both source filings
 on EDGAR, so any change can be checked against the original document in
-one click.</li>
+one click. Reports can also be searched in place (only the changes
+mentioning a word or phrase), shared via a link that reproduces the
+exact same report, and downloaded as a summary PDF or a share-card
+PNG image.</li>
 </ol>
 
 {pricing_section()}
@@ -1359,11 +1550,14 @@ def _read_body(environ) -> str:
 
 def application(environ, start_response):
     """WSGI app: / (search form + pricing), /report (POST form or GET
-    query), /waitlist (POST), the account pages (/signup, /login,
-    /logout, /account, /change-password, /forgot-password,
-    /forgot-username), the owner-only /stats (404 for everyone but the
-    STATS_USERNAME account), /healthz. All other paths 404; all failures
-    are honest error pages."""
+    query, with ?q= for search-in-report), the report downloads
+    (/report.csv, /report.xls, /report.pdf) and the /card share image —
+    all behind the same resolve-then-limit accounting as /report —
+    /waitlist (POST), the account pages (/signup, /login, /logout,
+    /account, /change-password, /forgot-password, /forgot-username),
+    the owner-only /stats (404 for everyone but the STATS_USERNAME
+    account), /healthz. All other paths 404; all failures are honest
+    error pages."""
     method = (environ.get("REQUEST_METHOD") or "GET").upper()
     path = environ.get("PATH_INFO") or "/"
     visitor_id, visitor_is_new = _visitor_id(environ)
@@ -1432,6 +1626,12 @@ def application(environ, start_response):
             return _download(start_response, environ, method, user,
                              visitor_id, cookie,
                              "csv" if path.endswith(".csv") else "xls")
+        if path == "/report.pdf":
+            return _pdf_download(start_response, environ, method, user,
+                                 visitor_id, cookie)
+        if path == "/card":
+            return _card(start_response, environ, method, user,
+                         visitor_id, cookie)
         if path == "/report":
             if method == "POST":
                 raw = _read_body(environ)

@@ -13,6 +13,7 @@ from .charts import render_chart_svg
 from .diffing import SectionDiff
 from .highlight import RISK_TERMS, highlight_risk
 from .score import FORMULA_TEXT, compute_score
+from .search import mark_search_term
 from .xbrl import XbrlResult, fmt_money
 
 
@@ -183,6 +184,10 @@ padding:.7rem 1rem;margin-top:.8rem}
 .score-how{margin-top:.5rem;font-size:.9rem;color:#374151}
 .score-how summary{cursor:pointer;font-weight:600}
 mark.risk{background:#fde68a;color:inherit;padding:0 .12em;border-radius:3px}
+mark.search{background:#bfdbfe;color:inherit;padding:0 .12em;border-radius:3px;
+box-shadow:inset 0 0 0 1px #60a5fa}
+.searchbanner{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;
+padding:.7rem 1rem;margin-top:.8rem}
 .chart{margin:1.2rem 0}
 .chart h3{margin:.4rem 0}
 """
@@ -190,7 +195,9 @@ mark.risk{background:#fde68a;color:inherit;padding:0 .12em;border-radius:3px}
 
 def render_html(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult,
                 summary: list[str] | None = None,
-                summary_kind: str = "") -> str:
+                summary_kind: str = "",
+                search_term: str | None = None,
+                search_base_url: str = "") -> str:
     d, m, a = _counts(diffs)
     e = html.escape
     p: list[str] = []
@@ -227,6 +234,21 @@ def render_html(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult,
         p.append(f"<div class='note'><strong>About this form:</strong> "
                  f"{e(FORM_NOTES[info.form])}</div>")
     p.append("</div>")
+    if search_term:
+        # `diffs` here are already the search-filtered hunks, so the
+        # counts above ARE the match counts; say exactly that, and
+        # offer the unfiltered report one click away.
+        n = d + m + a
+        remove = (f" <a href='{e(search_base_url, quote=True)}'>Show the "
+                  f"full report</a>." if search_base_url else "")
+        p.append("<div class='searchbanner'>")
+        p.append(f"<strong>Search: &lsquo;{e(search_term)}&rsquo;</strong> "
+                 f"— {n} change{'s' if n != 1 else ''} mention "
+                 f"&lsquo;{e(search_term)}&rsquo;. Only those changes are "
+                 f"shown below, with the term "
+                 f"<mark class='search'>highlighted</mark>. The search "
+                 f"runs after any risk-only / deletions-only / top-N "
+                 f"filters.{remove}</div>")
     if summary:
         p.append(f"<h2>Summary ({e(summary_kind)})</h2>")
         for ln in summary:
@@ -276,9 +298,18 @@ def render_html(info: FilingInfo, diffs: list[SectionDiff], xbrl: XbrlResult,
             old_html, n1 = highlight_risk(e(h.old)) if h.old else ("", 0)
             new_html, n2 = highlight_risk(e(h.new)) if h.new else ("", 0)
             risk_hits += n1 + n2
+            if search_term:
+                # Mark the search term on top of the risk marks; the
+                # marker protects tags/URLs, so the two markups can
+                # nest but never corrupt each other.
+                old_html, _ = mark_search_term(old_html, search_term)
+                new_html, _ = mark_search_term(new_html, search_term)
             hunks_html.append((h.kind, old_html, new_html))
         rendered.append((s, hunks_html))
     p.append("<h2>Text changes — deletions first</h2>")
+    if search_term and not rendered:
+        p.append(f"<p>No changes in this report mention "
+                 f"&lsquo;{e(search_term)}&rsquo;.</p>")
     if risk_hits:
         p.append(f"<p class='note'><mark class='risk'>Highlighted</mark> "
                  f"words are the published risk terms ({risk_hits} "

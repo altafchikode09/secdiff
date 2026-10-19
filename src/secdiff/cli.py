@@ -86,20 +86,36 @@ def build_diffs(old_text: str, new_text: str, form: str):
     return diffs, conf
 
 
+def _filtered_diffs(args, diffs):
+    """Apply the report's display filters (--section / --risk-only,
+    --deletions-only, --top N) to raw diffs. Shared by render_reports
+    and by the web PDF / share-card builders, so every surface shows
+    exactly the same set of changes for the same options."""
+    only_item = None
+    if getattr(args, "risk_only", False):
+        only_item = "1A"
+    elif getattr(args, "section", None):
+        only_item = resolve_section(args.section, getattr(args, "form", "10-K"))
+    return filter_diffs(diffs, only_item=only_item,
+                        deletions_only=getattr(args, "deletions_only", False),
+                        top=getattr(args, "top", None))
+
+
 def render_reports(args, info: FilingInfo, diffs, xbrl):
     """Filter + (optionally) summarise + render. Shared by the CLI and the
     web front end so both always produce the identical report.
 
     Returns (markdown, html, (deletions, modifications, additions)).
     """
-    only_item = None
-    if getattr(args, "risk_only", False):
-        only_item = "1A"
-    elif getattr(args, "section", None):
-        only_item = resolve_section(args.section, getattr(args, "form", "10-K"))
-    diffs = filter_diffs(diffs, only_item=only_item,
-                         deletions_only=getattr(args, "deletions_only", False),
-                         top=getattr(args, "top", None))
+    diffs = _filtered_diffs(args, diffs)
+    search = getattr(args, "search", None) or None
+    if search:
+        # Search-in-report runs LAST, on exactly the hunks the other
+        # filters produced (the report page says so, next to the
+        # count). The returned counts then describe the shown hunks,
+        # the same convention as every other filter.
+        from .search import filter_diffs_by_term
+        diffs, _matches = filter_diffs_by_term(diffs, search)
     summary, summary_kind = None, ""
     if getattr(args, "summarize", False):
         summary = llm_summary(diffs)
@@ -109,7 +125,9 @@ def render_reports(args, info: FilingInfo, diffs, xbrl):
             summary = extractive_summary(diffs)
             summary_kind = "extractive summary of the computed diff (no LLM used)"
     md = render_markdown(info, diffs, xbrl, summary, summary_kind)
-    ht = render_html(info, diffs, xbrl, summary, summary_kind)
+    ht = render_html(info, diffs, xbrl, summary, summary_kind,
+                     search_term=search,
+                     search_base_url=getattr(args, "search_base_url", ""))
     return md, ht, _counts(diffs)
 
 
